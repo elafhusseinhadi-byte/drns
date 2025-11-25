@@ -34,6 +34,7 @@ class UAV(BaseModel):
     target_city: str | None = None
     progress: int = 0
 
+
 class TransferRequest(BaseModel):
     uav_id: int
     from_city: str
@@ -112,7 +113,6 @@ async def put_uav(city: str, data: UAV):
             session.execute(stmt)
 
         session.commit()
-
         elapsed = (time.time() - start) * 1000
         return {"status": "ok", "put_time_ms": round(elapsed, 3)}
 
@@ -123,7 +123,7 @@ async def put_uav(city: str, data: UAV):
 # GET /city/{city}/uavs
 # =====================================================
 @app.get("/city/{city}/uavs")
-async def get_uavs(city: str, system_case: str = None):
+async def get_uavs(city: str, system_case: str | None = None):
     session = SessionLocal()
     start = time.time()
 
@@ -133,7 +133,6 @@ async def get_uavs(city: str, system_case: str = None):
             q = q.filter_by(system_case=system_case)
 
         rows = q.all()
-
         elapsed = (time.time() - start) * 1000
 
         return {
@@ -155,6 +154,29 @@ async def get_uavs(city: str, system_case: str = None):
             "db_size_kb": round(len(rows) * 0.5, 2),
         }
 
+    finally:
+        session.close()
+
+# =====================================================
+# ✅ NEW: DELETE /city/{city}/reset
+# يمسح كل الطائرات التابعة لمدينة معينة (مثلاً بغداد)
+# =====================================================
+@app.delete("/city/{city}/reset")
+async def reset_city(city: str):
+    session = SessionLocal()
+    start = time.time()
+    try:
+        stmt = uav_table.delete().where(uav_table.c.city_name == city)
+        result = session.execute(stmt)
+        session.commit()
+        elapsed = (time.time() - start) * 1000
+        deleted = result.rowcount if hasattr(result, "rowcount") else None
+        return {
+            "status": "ok",
+            "city": city,
+            "deleted_rows": deleted,
+            "reset_time_ms": round(elapsed, 3),
+        }
     finally:
         session.close()
 
@@ -251,7 +273,7 @@ def update_transfers(session, city):
 # POST /city/{city}/process
 # =====================================================
 @app.post("/city/{city}/process")
-async def process_uavs(city: str, system_case: str = None):
+async def process_uavs(city: str, system_case: str | None = None):
     session = SessionLocal()
     start = time.time()
 
@@ -271,6 +293,7 @@ async def process_uavs(city: str, system_case: str = None):
             for j in range(i + 1, n):
                 dx = uavs[i].x - uavs[j].x
                 dy = uavs[i].y - uavs[j].y
+                # هنا المسافة بالدرجات (تقريبية)، أنتِ في الواجهة تستخدمين 0.05
                 if (dx * dx + dy * dy) ** 0.5 < 5:
                     collisions += 1
 

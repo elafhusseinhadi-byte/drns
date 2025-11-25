@@ -1,5 +1,5 @@
 # =====================================================
-# 🚀 UAV Simulation Server – Multi-City Transfer + Random Spread
+# 🚀 UAV Simulation Server – Multi-City + Transfer + Spread + Debug
 # =====================================================
 
 from fastapi import FastAPI
@@ -9,10 +9,11 @@ from sqlalchemy import (
     MetaData, Table, and_
 )
 from sqlalchemy.orm import sessionmaker
+from fastapi.responses import FileResponse
 import time, asyncio, random
 
 # =====================================================
-# 🌍 City Coordinates (You can add more cities)
+# 🌍 City Coordinates
 # =====================================================
 CITY_COORDS = {
     "Baghdad": (33.3, 44.4),
@@ -21,7 +22,7 @@ CITY_COORDS = {
 }
 
 # =====================================================
-# 🛰️ UAV Model (received from client)
+# 🛰 UAV Model
 # =====================================================
 class UAV(BaseModel):
     uav_id: int
@@ -29,23 +30,22 @@ class UAV(BaseModel):
     y: float
     altitude: float
     speed: float
-    system_case: str       # normal, avoidance
+    system_case: str
     target_city: str | None = None
-    progress: int = 0      # 0..100
-
+    progress: int = 0
 
 class TransferRequest(BaseModel):
     uav_id: int
     from_city: str
     to_city: str
 
-
 # =====================================================
 # 🗄 Database Setup
 # =====================================================
-engine = create_engine("sqlite:///uav_db_full.sqlite",
-                       connect_args={"check_same_thread": False})
-
+engine = create_engine(
+    "sqlite:///uav_db_full.sqlite",
+    connect_args={"check_same_thread": False}
+)
 metadata = MetaData()
 
 uav_table = Table(
@@ -65,9 +65,9 @@ metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
 # =====================================================
-# 🚀 FASTAPI App
+# 🚀 FastAPI App
 # =====================================================
-app = FastAPI(title="UAV Simulation Server – Multi-City + Spread Fix")
+app = FastAPI(title="UAV Simulation Server – Multi-City")
 
 # =====================================================
 # PUT /city/{city}/uav
@@ -76,6 +76,7 @@ app = FastAPI(title="UAV Simulation Server – Multi-City + Spread Fix")
 async def put_uav(city: str, data: UAV):
     session = SessionLocal()
     start = time.time()
+
     try:
         existing = session.query(uav_table).filter_by(
             city_name=city,
@@ -111,12 +112,12 @@ async def put_uav(city: str, data: UAV):
             session.execute(stmt)
 
         session.commit()
-        elapsed_ms = (time.time() - start) * 1000
-        return {"status": "ok", "put_time_ms": round(elapsed_ms, 3)}
+
+        elapsed = (time.time() - start) * 1000
+        return {"status": "ok", "put_time_ms": round(elapsed, 3)}
 
     finally:
         session.close()
-
 
 # =====================================================
 # GET /city/{city}/uavs
@@ -125,84 +126,88 @@ async def put_uav(city: str, data: UAV):
 async def get_uavs(city: str, system_case: str = None):
     session = SessionLocal()
     start = time.time()
-    try:
-        query = session.query(uav_table).filter_by(city_name=city)
-        if system_case:
-            query = query.filter_by(system_case=system_case)
 
-        uavs = query.all()
-        elapsed_ms = (time.time() - start) * 1000
+    try:
+        q = session.query(uav_table).filter_by(city_name=city)
+        if system_case:
+            q = q.filter_by(system_case=system_case)
+
+        rows = q.all()
+
+        elapsed = (time.time() - start) * 1000
 
         return {
             "uavs": [
                 {
                     "uav_id": u.uav_id,
+                    "city_name": u.city_name,
                     "x": u.x,
                     "y": u.y,
                     "altitude": u.altitude,
                     "speed": u.speed,
                     "system_case": u.system_case,
-                    "city_name": u.city_name,
                     "target_city": u.target_city,
                     "progress": u.progress,
                 }
-                for u in uavs
+                for u in rows
             ],
-            "get_time_ms": round(elapsed_ms, 3),
-            "db_size_kb": round(len(uavs) * 0.5, 2),
+            "get_time_ms": round(elapsed, 3),
+            "db_size_kb": round(len(rows) * 0.5, 2),
         }
 
     finally:
         session.close()
 
-
 # =====================================================
-# POST /transfer — Start moving UAV to another city
+# POST /transfer
 # =====================================================
 @app.post("/transfer")
 async def transfer_uav(req: TransferRequest):
     session = SessionLocal()
+
     try:
-        uav = session.query(uav_table).filter_by(
+        u = session.query(uav_table).filter_by(
             city_name=req.from_city,
             uav_id=req.uav_id
         ).first()
 
-        if not uav:
-            return {"status": "error", "message": "UAV not found in source city"}
+        if not u:
+            return {"status": "error", "message": "UAV not found"}
 
         stmt = (
             uav_table.update()
-            .where(and_(
-                uav_table.c.city_name == req.from_city,
-                uav_table.c.uav_id == req.uav_id
-            ))
+            .where(
+                and_(
+                    uav_table.c.city_name == req.from_city,
+                    uav_table.c.uav_id == req.uav_id
+                )
+            )
             .values(target_city=req.to_city, progress=0)
         )
+
         session.execute(stmt)
         session.commit()
 
-        return {"status": "ok", "message": "Transfer Started"}
+        return {"status": "ok", "message": "Transfer started"}
 
     finally:
         session.close()
 
-
 # =====================================================
-# Internal function to update travel progress
+# Internal: Update travel progress
 # =====================================================
 def update_transfers(session, city):
-    uavs = (
-        session.query(uav_table)
-        .filter_by(city_name=city)
-        .filter(uav_table.c.target_city.isnot(None))
-        .all()
-    )
+    moving = session.query(uav_table).filter(
+        and_(
+            uav_table.c.city_name == city,
+            uav_table.c.target_city.isnot(None)
+        )
+    ).all()
 
     moved = 0
 
-    for u in uavs:
-        if u.city_name not in CITY_COORDS or u.target_city not in CITY_COORDS:
+    for u in moving:
+        if u.target_city not in CITY_COORDS:
             continue
 
         Ax, Ay = CITY_COORDS[u.city_name]
@@ -225,13 +230,10 @@ def update_transfers(session, city):
             .values(x=new_x, y=new_y, progress=new_progress)
         )
 
-        # =====================================================
-        # ⭐ Spread Fix — Random distribution when reaching target city
-        # =====================================================
+        # When reaching target city
         if new_progress >= 100:
             spread_x = random.uniform(-0.4, 0.4)
             spread_y = random.uniform(-0.4, 0.4)
-
             stmt = stmt.values(
                 city_name=u.target_city,
                 target_city=None,
@@ -245,7 +247,6 @@ def update_transfers(session, city):
 
     return moved
 
-
 # =====================================================
 # POST /city/{city}/process
 # =====================================================
@@ -258,22 +259,23 @@ async def process_uavs(city: str, system_case: str = None):
         moved = update_transfers(session, city)
         session.commit()
 
-        query = session.query(uav_table).filter_by(city_name=city)
+        q = session.query(uav_table).filter_by(city_name=city)
         if system_case:
-            query = query.filter_by(system_case=system_case)
+            q = q.filter_by(system_case=system_case)
 
-        uavs = query.all()
+        uavs = q.all()
         n = len(uavs)
 
         collisions = 0
         for i in range(n):
-            for j in range(i+1, n):
+            for j in range(i + 1, n):
                 dx = uavs[i].x - uavs[j].x
                 dy = uavs[i].y - uavs[j].y
-                if (dx*dx + dy*dy) ** 0.5 < 5:
+                if (dx * dx + dy * dy) ** 0.5 < 5:
                     collisions += 1
 
         await asyncio.sleep(0.001 * n)
+
         elapsed = (time.time() - start) * 1000
 
         return {
@@ -286,21 +288,10 @@ async def process_uavs(city: str, system_case: str = None):
     finally:
         session.close()
 
-
 # =====================================================
-# Health Check
+# DEBUG: View database
 # =====================================================
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-# =====================================================
-# Run Local
-# =====================================================
-if __name__ == "__main__":
-    import uvicorn
-    @app.get("/debug/db")
+@app.get("/debug/db")
 async def debug_db():
     session = SessionLocal()
     try:
@@ -324,4 +315,23 @@ async def debug_db():
     finally:
         session.close()
 
+# =====================================================
+# DEBUG: Download database file
+# =====================================================
+@app.get("/download/db")
+async def download_db():
+    return FileResponse("uav_db_full.sqlite")
+
+# =====================================================
+# HEALTH CHECK
+# =====================================================
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# =====================================================
+# RUN LOCAL
+# =====================================================
+if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=10000)

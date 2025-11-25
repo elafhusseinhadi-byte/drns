@@ -300,4 +300,28 @@ async def health():
 # =====================================================
 if __name__ == "__main__":
     import uvicorn
+    @app.get("/debug/db")
+async def debug_db():
+    session = SessionLocal()
+    try:
+        rows = session.query(uav_table).all()
+        return {
+            "rows": [
+                {
+                    "uav_id": u.uav_id,
+                    "city_name": u.city_name,
+                    "x": u.x,
+                    "y": u.y,
+                    "altitude": u.altitude,
+                    "speed": u.speed,
+                    "system_case": u.system_case,
+                    "target_city": u.target_city,
+                    "progress": u.progress,
+                }
+                for u in rows
+            ]
+        }
+    finally:
+        session.close()
+
     uvicorn.run(app, host="0.0.0.0", port=10000)

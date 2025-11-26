@@ -1,332 +1,336 @@
 # =====================================================
-# 🚀 UAV Single-City Simulation Server – Baghdad (Enhanced)
-#      Ultra-Motion + High Noise + Dynamic Direction
-#      Produces strong analytics & visible changes
+# 🛰 UAV Baghdad Server – AI Path + Collision Avoidance
+#   - Single City: Baghdad Only
+#   - FastAPI + SQLite + SQLAlchemy (ORM)
+#   - Server computes direction + goal (AI path)
+#   - Server performs collision avoidance
 # =====================================================
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String, MetaData, Table
-from sqlalchemy.orm import sessionmaker
-import random, math, asyncio
+from typing import Optional, List
+from sqlalchemy import create_engine, Column, Integer, Float, String
+from sqlalchemy.orm import sessionmaker, declarative_base
+from math import sqrt, atan2, cos, sin, pi
+import random
 
-# =====================================================
-# CITY CONFIG
-# =====================================================
-CITY_NAME   = "Baghdad"
-CITY_CENTER = (33.3, 44.4)
+# -----------------------------------------------------
+# ⚙️ Simulation constants
+# -----------------------------------------------------
+BAGHDAD_CENTER_X = 33.3
+BAGHDAD_CENTER_Y = 44.4
 
-COLLISION_THRESHOLD = 0.05
-NEAR_FACTOR         = 2.0
-AVOID_ALT_STEP      = 5
-AVOID_SPEED_STEP    = -3
+# حدود تقريبية للحركة داخل بغداد
+BAGHDAD_X_MIN = 33.0
+BAGHDAD_X_MAX = 33.6
+BAGHDAD_Y_MIN = 44.1
+BAGHDAD_Y_MAX = 44.7
 
-# 🔥🔥 الحركة الآن أسرع ×40
-MOVE_DT = 0.08
+COLLISION_THRESHOLD = 0.05   # threshold (approx degrees) for collision
+NEAR_FACTOR         = 2.0    # near = COLLISION_THRESHOLD * NEAR_FACTOR
+DT                   = 1.0   # simulation time step (sec)
+SCALE                = 0.0001  # تحويل m/s إلى تحرك بالإحداثيات (تقريبياً)
 
-# Zones
-NO_FLY_ZONES = [
-    {"cx": 33.3, "cy": 44.4, "r": 0.2},
-    {"cx": 33.0, "cy": 44.0, "r": 0.15},
-]
+# -----------------------------------------------------
+# 🛢️ Database setup (SQLite)
+# -----------------------------------------------------
+DB_URL = "sqlite:///./uav_baghdad.db"
 
-# =====================================================
-# MODELS
-# =====================================================
-class UAV(BaseModel):
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class UAVModel(Base):
+    __tablename__ = "uavs"
+
+    uav_id     = Column(Integer, primary_key=True, index=True)
+    x          = Column(Float, nullable=False)
+    y          = Column(Float, nullable=False)
+    altitude   = Column(Float, nullable=False)
+    speed      = Column(Float, nullable=False)
+    direction  = Column(Float, default=0.0)      # راديان
+    system_case = Column(String, default="normal")
+
+    # AI path: هدف داخلي لكل UAV
+    goal_x     = Column(Float, nullable=True)
+    goal_y     = Column(Float, nullable=True)
+
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------------------------------
+# 📦 FastAPI app
+# -----------------------------------------------------
+app = FastAPI(
+    title="Baghdad UAV Server – AI Path + Collision Avoidance",
+    version="1.0"
+)
+
+# -----------------------------------------------------
+# 📨 Pydantic models
+# -----------------------------------------------------
+class UAVIn(BaseModel):
+    """شكل البيانات اللي يرسلها الـ Client بالسيرفر."""
     uav_id: int
     x: float
     y: float
     altitude: float
     speed: float
     system_case: str = "normal"
+    # اختياري: إذا بديتي بديريكشن من الـ client
+    direction: Optional[float] = None
 
-# =====================================================
-# DATABASE
-# =====================================================
-engine = create_engine(
-    "sqlite:///uav_single_city.sqlite",
-    connect_args={"check_same_thread": False}
-)
+class UAVOut(BaseModel):
+    uav_id: int
+    x: float
+    y: float
+    altitude: float
+    speed: float
+    direction: float
+    system_case: str
+    goal_x: Optional[float]
+    goal_y: Optional[float]
 
-metadata = MetaData()
-uav_table = Table(
-    "uavs", metadata,
-    Column("uav_id", Integer, primary_key=True),
-    Column("x", Float),
-    Column("y", Float),
-    Column("altitude", Float),
-    Column("speed", Float),
-    Column("direction", Float),
-    Column("system_case", String),
-)
-metadata.create_all(engine)
+# -----------------------------------------------------
+# 🧩 Helper: random goal inside Baghdad
+# -----------------------------------------------------
+def random_goal_inside_baghdad():
+    gx = random.uniform(BAGHDAD_X_MIN, BAGHDAD_X_MAX)
+    gy = random.uniform(BAGHDAD_Y_MIN, BAGHDAD_Y_MAX)
+    return gx, gy
 
-SessionLocal = sessionmaker(bind=engine)
+# -----------------------------------------------------
+# 🧩 Helper: distance
+# -----------------------------------------------------
+def dist(x1, y1, x2, y2):
+    return sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
 
-# =====================================================
-# FASTAPI APP
-# =====================================================
-app = FastAPI(title="UAV – Enhanced Baghdad Server (Ultra Motion)")
-
-@app.get("/")
-async def home():
-    return {"server": "running", "city": CITY_NAME}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# =====================================================
-# HELPERS
-# =====================================================
-def distance(u1, u2):
-    return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
-
-def inside_nfz_xy(x, y):
-    for idx, z in enumerate(NO_FLY_ZONES):
-        dx = x - z["cx"]
-        dy = y - z["cy"]
-        if math.sqrt(dx*dx + dy*dy) <= z["r"]:
-            return True, idx
-    return False, None
-
-def move_uav(u):
-    # 🔥 حركة أسرع (بسبب MOVE_DT الكبير)
-    x = u.x + u.speed * math.cos(u.direction) * MOVE_DT
-    y = u.y + u.speed * math.sin(u.direction) * MOVE_DT
-
-    # 🔥 Noise قوي حتى يصير Near / Collision واضح
-    x += random.uniform(-0.0015, 0.0015)
-    y += random.uniform(-0.0015, 0.0015)
-
-    # 🔥 اتجاه ديناميكي – حتى لا تمشي بخط مستقيم
-    u.direction += random.uniform(-0.1, 0.1)
-
-    return x, y
-
-def compute_future_prediction(uavs):
-    future_set = set()
-    for u in uavs:
-        fx = u.x + u.speed * math.cos(u.direction) * 0.0008
-        fy = u.y + u.speed * math.sin(u.direction) * 0.0008
-        for v in uavs:
-            if v.uav_id != u.uav_id:
-                d = math.sqrt((fx - v.x)**2 + (fy - v.y)**2)
-                if d < COLLISION_THRESHOLD:
-                    future_set.add(u.uav_id)
-                    future_set.add(v.uav_id)
-    return future_set
-
-def compute_risk(uavs, future_ids):
-    risks = {}
-    for u in uavs:
-        min_d = 999
-        for v in uavs:
-            if v.uav_id != u.uav_id:
-                min_d = min(min_d, distance(u, v))
-
-        is_near   = min_d < COLLISION_THRESHOLD * NEAR_FACTOR
-        is_future = u.uav_id in future_ids
-        score = 0
-        if min_d < COLLISION_THRESHOLD: score += 1.0
-        if is_near:                     score += 0.5
-        if is_future:                   score += 0.8
-        risks[u.uav_id] = round(score, 3)
-    return risks
-
-# =====================================================
-# PUT /uav
-# =====================================================
-@app.put("/uav")
-async def put_uav(data: UAV):
-    session = SessionLocal()
-    try:
-        existing = session.query(uav_table).filter_by(uav_id=data.uav_id).first()
-        direction = random.uniform(0, 2*math.pi)
-
-        values = {
-            "x": data.x,
-            "y": data.y,
-            "altitude": data.altitude,
-            "speed": data.speed,
-            "system_case": data.system_case,
-            "direction": direction if not existing else existing.direction,
-        }
-
-        if existing:
-            stmt = uav_table.update().where(
-                uav_table.c.uav_id == data.uav_id
-            ).values(**values)
-        else:
-            stmt = uav_table.insert().values(uav_id=data.uav_id, **values)
-
-        session.execute(stmt)
-        session.commit()
-        return {"status": "ok"}
-
-    finally:
-        session.close()
-
-# =====================================================
-# GET /uavs
-# =====================================================
-@app.get("/uavs")
-async def get_uavs():
-    session = SessionLocal()
-    try:
-        rows = session.query(uav_table).all()
-        if not rows:
-            return {"uavs": []}
-
-        uavs = rows
-        future_ids = compute_future_prediction(uavs)
-        risks      = compute_risk(uavs, future_ids)
-
-        result = []
-        for u in uavs:
-            in_nfz, _ = inside_nfz_xy(u.x, u.y)
-            result.append({
-                "uav_id": u.uav_id,
-                "x": u.x,
-                "y": u.y,
-                "altitude": u.altitude,
-                "speed": u.speed,
-                "direction": u.direction,
-                "system_case": u.system_case,
-                "future_risk": (u.uav_id in future_ids),
-                "risk_score": risks[u.uav_id],
-                "in_nfz": in_nfz,
-            })
-
-        return {"uavs": result}
-
-    finally:
-        session.close()
-
-# =====================================================
-# DELETE /reset
-# =====================================================
+# -----------------------------------------------------
+# 🔁 /reset – حذف كل الـ UAVs
+# -----------------------------------------------------
 @app.delete("/reset")
-async def reset():
-    session = SessionLocal()
+def reset():
+    db = SessionLocal()
     try:
-        session.query(uav_table).delete()
-        session.commit()
-        return {"status": "cleared"}
+        db.query(UAVModel).delete()
+        db.commit()
+        return {"status": "reset_done", "city": "Baghdad"}
     finally:
-        session.close()
+        db.close()
 
-# =====================================================
-# POST /process
-# =====================================================
-@app.post("/process")
-async def process_step():
-    session = SessionLocal()
+# -----------------------------------------------------
+# 📥 PUT /uav – إدخال أو تحديث UAV
+#   Client يحط بس Baghdad, السيرفر يتكفل بالـ direction + goal
+# -----------------------------------------------------
+@app.put("/uav")
+def upsert_uav(uav: UAVIn):
+    db = SessionLocal()
     try:
-        uavs = session.query(uav_table).all()
-        n = len(uavs)
+        row = db.query(UAVModel).filter(UAVModel.uav_id == uav.uav_id).first()
 
-        if n == 0:
-            return {
-                "processed": 0,
-                "collisions_before_prediction": 0,
-                "near_before_prediction": 0,
-                "collisions_after_prediction": 0,
-                "near_after_prediction": 0,
-                "nfz_hits": 0,
-                "future_risky": [],
-                "risk_scores": {},
-                "status": "ok"
-            }
+        if row is None:
+            # أول مرة – نعين هدف عشوائي داخل بغداد
+            gx, gy = random_goal_inside_baghdad()
+            direction = uav.direction if uav.direction is not None else random.uniform(-pi, pi)
 
-        # NFZ enforcement
-        nfz_hits = 0
-        for u in uavs:
-            in_nfz, idx = inside_nfz_xy(u.x, u.y)
-            if in_nfz:
-                nfz_hits += 1
-                z = NO_FLY_ZONES[idx]
-                dx = u.x - z["cx"]
-                dy = u.y - z["cy"]
-                d  = math.sqrt(dx*dx + dy*dy) or 0.001
-                u.x = z["cx"] + dx/d * (z["r"] + 0.01)
-                u.y = z["cy"] + dy/d * (z["r"] + 0.01)
-                u.altitude += AVOID_ALT_STEP
-                u.speed = max(2, u.speed + AVOID_SPEED_STEP)
-
-        # Before prediction
-        coll_before = 0
-        near_before = 0
-        for i in range(n):
-            for j in range(i+1, n):
-                d = distance(uavs[i], uavs[j])
-                if d < COLLISION_THRESHOLD:
-                    coll_before += 1
-                elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
-                    near_before += 1
-
-        # Prediction
-        future_ids = compute_future_prediction(uavs)
-
-        # Apply avoidance
-        for u in uavs:
-            if u.uav_id in future_ids:
-                u.altitude += AVOID_ALT_STEP
-                u.speed = max(2, u.speed + AVOID_SPEED_STEP)
-                u.direction += random.uniform(-0.3, 0.3)
-
-        # After prediction
-        coll_after = 0
-        near_after = 0
-        for i in range(n):
-            for j in range(i+1, n):
-                d = distance(uavs[i], uavs[j])
-                if d < COLLISION_THRESHOLD:
-                    coll_after += 1
-                elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
-                    near_after += 1
-
-        # MOVE all UAVs
-        for u in uavs:
-            new_x, new_y = move_uav(u)
-            stmt = uav_table.update().where(
-                uav_table.c.uav_id == u.uav_id
-            ).values(
-                x=new_x,
-                y=new_y,
-                altitude=u.altitude,
-                speed=u.speed,
-                direction=u.direction,
+            row = UAVModel(
+                uav_id=uav.uav_id,
+                x=uav.x,
+                y=uav.y,
+                altitude=uav.altitude,
+                speed=uav.speed,
+                direction=direction,
+                system_case=uav.system_case,
+                goal_x=gx,
+                goal_y=gy,
             )
-            session.execute(stmt)
+            db.add(row)
+        else:
+            # تحديث – نبقي الهدف إذا موجود
+            row.x = uav.x
+            row.y = uav.y
+            row.altitude = uav.altitude
+            row.speed = uav.speed
+            row.system_case = uav.system_case
 
-        session.commit()
+            if uav.direction is not None:
+                row.direction = uav.direction
 
-        # Compute risk after move
-        uavs_after = session.query(uav_table).all()
-        future_ids_after = compute_future_prediction(uavs_after)
-        risks = compute_risk(uavs_after, future_ids_after)
+            # إذا ما عنده هدف – نعين هدف جديد
+            if row.goal_x is None or row.goal_y is None:
+                gx, gy = random_goal_inside_baghdad()
+                row.goal_x, row.goal_y = gx, gy
+
+        db.commit()
+        return {"status": "ok", "uav_id": uav.uav_id}
+    finally:
+        db.close()
+
+# -----------------------------------------------------
+# 📤 GET /uavs – إرجاع كل الطائرات
+# -----------------------------------------------------
+@app.get("/uavs", response_model=dict)
+def get_uavs():
+    db = SessionLocal()
+    try:
+        rows = db.query(UAVModel).all()
+        out: List[UAVOut] = []
+        for r in rows:
+            out.append(UAVOut(
+                uav_id=r.uav_id,
+                x=r.x,
+                y=r.y,
+                altitude=r.altitude,
+                speed=r.speed,
+                direction=r.direction,
+                system_case=r.system_case,
+                goal_x=r.goal_x,
+                goal_y=r.goal_y,
+            ))
+        return {"count": len(out), "uavs": [o.dict() for o in out]}
+    finally:
+        db.close()
+
+# -----------------------------------------------------
+# 🤖 AI Path + Collision Avoidance – /process
+#   - يحسب اتجاه لكل UAV نحو goal
+#   - يحرك الطائرات خطوة واحدة
+#   - يكشف الأزواج القريبة / المتصادمة
+#   - ينفذ Collision Avoidance (تغيير اتجاه + تقليل سرعة)
+# -----------------------------------------------------
+@app.post("/process")
+def process_step():
+    db = SessionLocal()
+    try:
+        uavs: List[UAVModel] = db.query(UAVModel).all()
+        if not uavs:
+            return {"status": "no_uavs"}
+
+        # 1) تأكد لكل UAV هدف (goal_x, goal_y)
+        for u in uavs:
+            if u.goal_x is None or u.goal_y is None:
+                u.goal_x, u.goal_y = random_goal_inside_baghdad()
+
+        # 2) احسب الـ base direction ناحية الهدف
+        for u in uavs:
+            dxg = u.goal_x - u.x
+            dyg = u.goal_y - u.y
+            # إذا الهدف قريب جداً – عيّن هدف جديد حتى تستمر الحركة
+            if dist(u.x, u.y, u.goal_x, u.goal_y) < 0.02:
+                u.goal_x, u.goal_y = random_goal_inside_baghdad()
+                dxg = u.goal_x - u.x
+                dyg = u.goal_y - u.y
+            u.direction = atan2(dyg, dxg)
+            # نرجع system_case طبيعي قبل الحساب
+            u.system_case = "normal"
+
+        # 3) احسب موضع مقترح (proposed positions) بدون Avoidance
+        proposed = {}
+        for u in uavs:
+            nx = u.x + u.speed * DT * SCALE * cos(u.direction)
+            ny = u.y + u.speed * DT * SCALE * sin(u.direction)
+            proposed[u.uav_id] = (nx, ny)
+
+        # 4) كشف الاصطدام / القرب
+        collision_pairs = set()    # أزواج مسافة < COLLISION_THRESHOLD
+        near_pairs = set()         # أزواج مسافة < NEAR_FACTOR * COLLISION_THRESHOLD
+
+        for i in range(len(uavs)):
+            ui = uavs[i]
+            xi, yi = proposed[ui.uav_id]
+            for j in range(i + 1, len(uavs)):
+                uj = uavs[j]
+                xj, yj = proposed[uj.uav_id]
+                d = dist(xi, yi, xj, yj)
+                if d < COLLISION_THRESHOLD:
+                    collision_pairs.add(frozenset({ui.uav_id, uj.uav_id}))
+                elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
+                    near_pairs.add(frozenset({ui.uav_id, uj.uav_id}))
+
+        # 5) Collision Avoidance: عدّل الاتجاه + السرعة للأزواج الخطرة
+        # نستخدم قاموس لسهولة الوصول
+        uav_by_id = {u.uav_id: u for u in uavs}
+
+        # أزواج الاصطدام – مناورة قوية
+        for pair in collision_pairs:
+            id1, id2 = tuple(pair)
+            u1 = uav_by_id[id1]
+            u2 = uav_by_id[id2]
+
+            # اتجاه الخط بينهما
+            angle_12 = atan2(u2.y - u1.y, u2.x - u1.x)
+
+            # نلفهم ± 90 درجة حتى يبتعدون
+            turn_angle = pi / 2.0
+
+            u1.direction = angle_12 - turn_angle
+            u2.direction = angle_12 + turn_angle
+
+            # نقلل السرعة شوية لزيادة الأمان
+            u1.speed *= 0.7
+            u2.speed *= 0.7
+
+            u1.system_case = "avoidance"
+            u2.system_case = "avoidance"
+
+        # أزواج القريبة فقط – مناورة خفيفة
+        for pair in near_pairs:
+            if pair in collision_pairs:
+                continue
+            id1, id2 = tuple(pair)
+            u1 = uav_by_id[id1]
+            u2 = uav_by_id[id2]
+
+            angle_12 = atan2(u2.y - u1.y, u2.x - u1.x)
+            turn_angle = pi / 4.0  # 45 درجة
+
+            # نغيّر الاتجاه شويّة بعيداً عن بعض
+            u1.direction = angle_12 - turn_angle
+            u2.direction = angle_12 + turn_angle
+
+            # تقليل بسيط بالسرعة
+            u1.speed *= 0.9
+            u2.speed *= 0.9
+
+            # نخليها "avoidance" حتى يميّزها الـ Dashboard
+            if u1.system_case != "avoidance":
+                u1.system_case = "avoidance"
+            if u2.system_case != "avoidance":
+                u2.system_case = "avoidance"
+
+        # 6) احسب الموضع النهائي بعد Collision Avoidance
+        moved = 0
+        for u in uavs:
+            nx = u.x + u.speed * DT * SCALE * cos(u.direction)
+            ny = u.y + u.speed * DT * SCALE * sin(u.direction)
+
+            # نضمن تبقى داخل حدود بغداد التقريبية
+            nx = min(max(nx, BAGHDAD_X_MIN), BAGHDAD_X_MAX)
+            ny = min(max(ny, BAGHDAD_Y_MIN), BAGHDAD_Y_MAX)
+
+            u.x = nx
+            u.y = ny
+            moved += 1
+
+        db.commit()
 
         return {
-            "processed": n,
-            "collisions_before_prediction": coll_before,
-            "near_before_prediction": near_before,
-            "collisions_after_prediction": coll_after,
-            "near_after_prediction": near_after,
-            "nfz_hits": nfz_hits,
-            "future_risky": list(future_ids_after),
-            "risk_scores": risks,
-            "status": "ok"
+            "status": "ok",
+            "processed": moved,
+            "collisions_detected": len(collision_pairs),
+            "near_pairs": len(near_pairs),
+            "collision_pairs": [list(p) for p in collision_pairs],
+            "near_pairs_list": [list(p) for p in near_pairs],
         }
-
     finally:
-        session.close()
+        db.close()
 
-
-# =====================================================
-# LOCAL RUN
-# =====================================================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+# -----------------------------------------------------
+# 🌐 Root
+# -----------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "server": "Baghdad UAV Server – AI Path + Collision Avoidance",
+        "city": "Baghdad",
+        "note": "Use /uav (PUT), /uavs (GET), /process (POST), /reset (DELETE)."
+    }

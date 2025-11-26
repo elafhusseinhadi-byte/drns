@@ -1,6 +1,6 @@
 # =====================================================
 # 🚀 UAV Single-City Simulation Server – Baghdad Only
-#    مع تنبؤ + NFZ + مقارنة تصادم قبل/بعد NFZ
+#    Prediction-Ready + NFZ + Before/After Prediction
 # =====================================================
 
 from fastapi import FastAPI
@@ -15,13 +15,13 @@ import random, math, asyncio
 CITY_NAME   = "Baghdad"
 CITY_CENTER = (33.3, 44.4)
 
-COLLISION_THRESHOLD = 0.05    # نفس اللي تستعملينه بالـ UI
+COLLISION_THRESHOLD = 0.05    # نفس الـ Threshold في الواجهة
 NEAR_FACTOR         = 2.0     # near = d < TH * NEAR_FACTOR
-AVOID_ALT_STEP      = 5       # رفع الارتفاع إذا قريب
+AVOID_ALT_STEP      = 5       # رفع الارتفاع عند الخطر
 AVOID_SPEED_STEP    = -3      # تقليل السرعة عند الاقتراب
-MOVE_DT             = 0.002   # خطوة الحركة
+MOVE_DT             = 0.002   # خطوة الحركة (Δt)
 
-# مناطق الحظر (نفس ال Dashboard تقريباً)
+# مناطق الحظر (NFZ) – تستخدم هنا ومع /uavs
 NO_FLY_ZONES = [
     {"cx": 33.3, "cy": 44.4, "r": 0.2},   # Center NFZ
     {"cx": 33.0, "cy": 44.0, "r": 0.15},  # South NFZ
@@ -64,7 +64,7 @@ SessionLocal = sessionmaker(bind=engine)
 # =====================================================
 # FASTAPI APP
 # =====================================================
-app = FastAPI(title="UAV – Single-City Baghdad Simulation")
+app = FastAPI(title="UAV – Single-City Baghdad Simulation (Prediction-Ready)")
 
 @app.get("/")
 async def home():
@@ -75,13 +75,14 @@ async def health():
     return {"status": "ok"}
 
 # =====================================================
-# HELPERS
+# HELPER FUNCTIONS
 # =====================================================
 def distance(u1, u2):
+    """المسافة الإقليدية بين طائرتين."""
     return math.sqrt((u1.x - u2.x)**2 + (u1.y - u2.y)**2)
 
 def move_uav(u):
-    """حركة بسيطة + شوّش بسيط (noise)."""
+    """حركة بسيطة + noise خفيف."""
     x = u.x + u.speed * math.cos(u.direction) * MOVE_DT
     y = u.y + u.speed * math.sin(u.direction) * MOVE_DT
 
@@ -90,7 +91,7 @@ def move_uav(u):
     return x, y
 
 def inside_nfz_xy(x, y):
-    """هل النقطة (x,y) داخل أي NFZ؟ ترجع (bool, index)."""
+    """هل النقطة (x,y) داخل أي منطقة NFZ؟ ترجع (bool, idx أو None)."""
     for idx, z in enumerate(NO_FLY_ZONES):
         dx = x - z["cx"]
         dy = y - z["cy"]
@@ -101,8 +102,8 @@ def inside_nfz_xy(x, y):
 def compute_future_prediction(uavs):
     """
     AI-like prediction:
-    نحسب موقع مستقبلي صغير لكل UAV
-    ونحسب إذا المسافة المستقبلية بين زوجين < threshold.
+    - نحسب موقع مستقبلي صغير لكل UAV باستخدام direction + speed.
+    - إذا المسافة المستقبلية أقل من threshold → نعتبرهم future-risky.
     """
     future_points = []
     future_set = set()
@@ -126,10 +127,10 @@ def compute_future_prediction(uavs):
 
 def compute_risk(uavs, future_ids):
     """
-    حساب risk score لكل UAV اعتماداً على:
-    - أقل مسافة مع الأقرب
-    - هل ضمن near؟
-    - هل ضمن future risky؟
+    Risk score بسيط لكل UAV:
+    - أقل مسافة مع أقرب طائرة
+    - حالة near
+    - حالة future_risky
     """
     risks = {}
     for u in uavs:
@@ -141,8 +142,8 @@ def compute_risk(uavs, future_ids):
             if d < min_dist:
                 min_dist = d
 
-        is_near    = min_dist < COLLISION_THRESHOLD * NEAR_FACTOR
-        is_future  = u.uav_id in future_ids
+        is_near   = min_dist < COLLISION_THRESHOLD * NEAR_FACTOR
+        is_future = u.uav_id in future_ids
 
         score = 0.0
         if min_dist < COLLISION_THRESHOLD:
@@ -164,6 +165,7 @@ async def put_uav(data: UAV):
     try:
         existing = session.query(uav_table).filter_by(uav_id=data.uav_id).first()
 
+        # اتجاه عشوائي إذا كانت طائرة جديدة
         direction = random.uniform(0, 2 * math.pi)
 
         values = {
@@ -190,7 +192,7 @@ async def put_uav(data: UAV):
         session.close()
 
 # =====================================================
-# GET /uavs – إرجاع حالة الطائرات مع التنبؤ
+# GET /uavs – إرجاع حالة الطائرات مع risk + future_risk + NFZ flag
 # =====================================================
 @app.get("/uavs")
 async def get_uavs():
@@ -226,7 +228,7 @@ async def get_uavs():
         session.close()
 
 # =====================================================
-# DELETE /reset
+# DELETE /reset – مسح كل الطائرات
 # =====================================================
 @app.delete("/reset")
 async def reset():
@@ -239,7 +241,7 @@ async def reset():
         session.close()
 
 # =====================================================
-# POST /process – الحركة + Avoidance + NFZ + مقارنة قبل/بعد
+# POST /process – الحركة + NFZ + Prediction Before/After
 # =====================================================
 @app.post("/process")
 async def process_step():
@@ -251,28 +253,19 @@ async def process_step():
         if n == 0:
             return {
                 "processed": 0,
-                "collisions_before_nfz": 0,
-                "near_before_nfz": 0,
-                "collisions_after_nfz": 0,
-                "near_after_nfz": 0,
+                "collisions_before_prediction": 0,
+                "near_before_prediction": 0,
+                "collisions_after_prediction": 0,
+                "near_after_prediction": 0,
                 "nfz_hits": 0,
                 "future_risky": [],
                 "risk_scores": {},
                 "status": "ok"
             }
 
-        # -------- 0) تصادمات قبل NFZ (baseline) --------
-        collisions_before = 0
-        near_before = 0
-        for i in range(n):
-            for j in range(i+1, n):
-                d = distance(uavs[i], uavs[j])
-                if d < COLLISION_THRESHOLD:
-                    collisions_before += 1
-                elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
-                    near_before += 1
-
-        # -------- 1) تطبيق NFZ avoidance --------
+        # --------------------------------------------
+        # (0) Enforcement NFZ أولاً (بيئة ثابتة)
+        # --------------------------------------------
         nfz_hits = 0
         for u in uavs:
             in_nfz, idx = inside_nfz_xy(u.x, u.y)
@@ -282,32 +275,62 @@ async def process_step():
                 dx = u.x - z["cx"]
                 dy = u.y - z["cy"]
                 d  = math.sqrt(dx*dx + dy*dy) or 0.001
-                # نطرده للخارج شعاعياً من مركز الـ NFZ
+                # نخرجه إلى خارج الدائرة بشعاع بسيط
                 u.x = z["cx"] + dx/d * (z["r"] + 0.01)
                 u.y = z["cy"] + dy/d * (z["r"] + 0.01)
-                # نرفع الارتفاع قليلاً + نقلل السرعة (سلوك أمان)
+                # نرفع الارتفاع ونقلل السرعة (سلوك أمان)
                 u.altitude += AVOID_ALT_STEP
                 u.speed = max(2, u.speed + AVOID_SPEED_STEP)
 
-        # -------- 2) تصادمات بعد NFZ --------
-        collisions_after = 0
-        near_after = 0
+        # --------------------------------------------
+        # (1) Collisions & Near "قبل التنبؤ"
+        # --------------------------------------------
+        coll_before_pred = 0
+        near_before_pred = 0
         for i in range(n):
             for j in range(i+1, n):
                 d = distance(uavs[i], uavs[j])
                 if d < COLLISION_THRESHOLD:
-                    collisions_after += 1
+                    coll_before_pred += 1
                 elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
-                    near_after += 1
-                    # هنا نطبق collision avoidance العادي
-                    uavs[i].altitude += AVOID_ALT_STEP
-                    uavs[j].altitude += AVOID_ALT_STEP
-                    uavs[i].speed = max(2, uavs[i].speed + AVOID_SPEED_STEP)
-                    uavs[j].speed = max(2, uavs[j].speed + AVOID_SPEED_STEP)
-                    uavs[i].direction += random.uniform(-0.3, 0.3)
-                    uavs[j].direction += random.uniform(-0.3, 0.3)
+                    near_before_pred += 1
 
-        # -------- 3) الحركة --------
+        # --------------------------------------------
+        # (2) حساب التنبؤ المستقبلي (AI-like)
+        # --------------------------------------------
+        future_ids = compute_future_prediction(uavs)
+
+        # --------------------------------------------
+        # (3) تطبيق خوارزمية التنبؤ (Prediction Avoidance)
+        #     فقط على الطائرات الـ future_risky
+        # --------------------------------------------
+        for u in uavs:
+            if u.uav_id in future_ids:
+                # نرفع الارتفاع
+                u.altitude += AVOID_ALT_STEP
+                # نبطئ السرعة
+                u.speed = max(2, u.speed + AVOID_SPEED_STEP)
+                # نغير الاتجاه قليلاً
+                u.direction += random.uniform(-0.3, 0.3)
+
+        # --------------------------------------------
+        # (4) Collisions & Near "بعد التنبؤ"
+        # --------------------------------------------
+        coll_after_pred = 0
+        near_after_pred = 0
+        for i in range(n):
+            for j in range(i+1, n):
+                d = distance(uavs[i], uavs[j])
+                if d < COLLISION_THRESHOLD:
+                    coll_after_pred += 1
+                elif d < COLLISION_THRESHOLD * NEAR_FACTOR:
+                    near_after_pred += 1
+                    # ممكن أيضاً نطبق avoidance عادي هنا لو حابة
+                    # لكن حالياً نكتفي بحساب الإحصائيات
+
+        # --------------------------------------------
+        # (5) حركة الطائرات بعد كل التعديلات
+        # --------------------------------------------
         for u in uavs:
             new_x, new_y = move_uav(u)
             stmt = uav_table.update().where(
@@ -323,20 +346,26 @@ async def process_step():
 
         session.commit()
 
-        # -------- 4) تنبؤ المستقبل + درجة الخطورة --------
-        future_ids = compute_future_prediction(uavs)
-        risks = compute_risk(uavs, future_ids)
+        # --------------------------------------------
+        # (6) Risk + Future بعد الحركة
+        # --------------------------------------------
+        # نعيد قراءة الحالات حتى نحسب risk على مواقع شبه محدثة
+        uavs_after = session.query(uav_table).all()
+        future_ids_after = compute_future_prediction(uavs_after)
+        risks = compute_risk(uavs_after, future_ids_after)
 
         await asyncio.sleep(0.001 * n)
 
         return {
             "processed": n,
-            "collisions_before_nfz": collisions_before,
-            "near_before_nfz": near_before,
-            "collisions_after_nfz": collisions_after,
-            "near_after_nfz": near_after,
+            # قيم خاصة بالداشبورد (قبل/بعد التنبؤ)
+            "collisions_before_prediction": coll_before_pred,
+            "near_before_prediction": near_before_pred,
+            "collisions_after_prediction": coll_after_pred,
+            "near_after_prediction": near_after_pred,
+            # معلومات إضافية (تقدرين تستخدمينها إذا حبيتي)
             "nfz_hits": nfz_hits,
-            "future_risky": list(future_ids),
+            "future_risky": list(future_ids_after),
             "risk_scores": risks,
             "status": "ok"
         }
@@ -345,7 +374,7 @@ async def process_step():
         session.close()
 
 # =====================================================
-# LOCAL RUN
+# LOCAL RUN (for testing)
 # =====================================================
 if __name__ == "__main__":
     import uvicorn

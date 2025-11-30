@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 import math
+import random
 
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -109,25 +110,25 @@ class UAVListOut(BaseModel):
 # ======================================
 
 app = FastAPI(
-    title="UAV Server – Collision + AI + Logging (Server-Side Avoidance)",
+    title="UAV Server – Collision + Predictive + Server-Side Avoidance",
     version="3.0"
 )
 
 # Thresholds بالكيلومتر
 THR_COLLISION_KM = 1.0       # تصادم
-THR_NEAR_KM = 3.0            # نهاية منطقة الخطر
-INNER_NEAR_KM = 1.5          # near الداخلي (اللي قلتي عليه)
+INNER_NEAR_KM = 1.5          # Near الداخلي
+THR_NEAR_KM = 3.0            # نهاية الـ Near
 
 
 # ======================================
-# 🧮 دوال مساعدة: مسافة / سرعة / Conflicts / Avoidance
+# 🧮 دوال مساعدة
 # ======================================
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
-    حساب مسافة حقيقية تقريباً بالكيلومتر بين نقطتين (lat, lon)
+    مسافة تقريبية بالكيلومتر بين نقطتين (lat, lon)
     """
-    R = 6371.0  # نصف قطر الأرض بالكيلومتر
+    R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -140,8 +141,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[str, float]]:
     """
-    "Predictive AI" بسيطة: تحسب السرعة المتوسطة من آخر N نقاط لكل UAV
-    vx, vy = delta_pos / delta_time
+    Predictive AI بسيطة: سرعة متوسطة لكل UAV من آخر history_window نقاط
     """
     result: Dict[int, Dict[str, float]] = {}
 
@@ -176,7 +176,7 @@ def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[s
 
 def predict_position(uav: UAVState, vel: Dict[str, float], t: float = 5.0) -> Prediction:
     """
-    توقع الموقع بعد t ثانية (إحداثيات، مو كم)
+    توقع موقع UAV بعد t ثانية (إحداثيات)
     """
     x_pred = uav.x + vel.get("vx", 0.0) * t
     y_pred = uav.y + vel.get("vy", 0.0) * t
@@ -185,10 +185,10 @@ def predict_position(uav: UAVState, vel: Dict[str, float], t: float = 5.0) -> Pr
 
 def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
     """
-    Multi-UAV conflict control:
-    - حساب أقل مسافة لكل طائرة
-    - تعيين حالة safe / near / collision
-    - بناء قائمة من يكون قريب من منو
+    حساب:
+    - أقل مسافة لكل UAV
+    - حالة safe / near / collision
+    - قائمة الـ conflicts
     """
     n = len(uavs)
     info: Dict[int, Dict[str, Any]] = {}
@@ -205,16 +205,13 @@ def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
         for j in range(i + 1, n):
             uj = uavs[j]
 
-            # مسافة بالكيلومتر
             d = haversine_km(ui.y, ui.x, uj.y, uj.x)
 
-            # أقل مسافة
             if d < info[ui.uav_id]["min_dist"]:
                 info[ui.uav_id]["min_dist"] = d
             if d < info[uj.uav_id]["min_dist"]:
                 info[uj.uav_id]["min_dist"] = d
 
-            # Near / Collision
             if d < THR_NEAR_KM:
                 info[ui.uav_id]["conflicts"].add(uj.uav_id)
                 info[uj.uav_id]["conflicts"].add(ui.uav_id)
@@ -228,7 +225,6 @@ def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
                 if info[uj.uav_id]["status"] != "collision":
                     info[uj.uav_id]["status"] = "near"
 
-    # إذا UAV وحدها، نخلي min_dist كبير
     for u in uavs:
         if info[u.uav_id]["min_dist"] == float("inf"):
             info[u.uav_id]["min_dist"] = 9999.0
@@ -241,12 +237,10 @@ def compute_server_avoidance(
     conflict_info: Dict[int, Dict[str, Any]]
 ) -> Dict[int, Optional[Avoidance]]:
     """
-    تجنّب داخل السيرفر:
-    - يستخدم 3 مستويات:
-      * d < 1 km        → Collision  → تجنب قوي
-      * 1 ≤ d < 1.5 km  → Inner Near → تجنب متوسط (يغير اتجاهه بوضوح)
-      * 1.5 ≤ d < 3 km  → Outer Near → تجنب خفيف
-    - يرجع Avoidance لكل UAV (أو None)
+    تجنّب داخل السيرفر (3 مستويات):
+    - d < 1 km        → Collision  → قوي
+    - 1 ≤ d < 1.5 km  → Inner Near → متوسط
+    - 1.5 ≤ d < 3 km  → Outer Near → خفيف
     """
     id_to_uav = {u.uav_id: u for u in uavs}
     result: Dict[int, Optional[Avoidance]] = {}
@@ -260,7 +254,6 @@ def compute_server_avoidance(
             result[u.uav_id] = None
             continue
 
-        # متّجه تنافري من الجيران
         ax = 0.0
         ay = 0.0
         for nid in neighbors_ids:
@@ -274,17 +267,13 @@ def compute_server_avoidance(
         ax /= len(neighbors_ids)
         ay /= len(neighbors_ids)
 
-        # اختيار قوة الدفع حسب المسافة (3-Zone Near)
         if dmin < THR_COLLISION_KM:
-            # 🔴 Collision – قوي
             scale = 0.015
             note = "Strong avoidance (collision zone)"
         elif dmin < INNER_NEAR_KM:
-            # 🟠 Near الداخلي
             scale = 0.008
             note = "Medium avoidance (inner near zone)"
         else:
-            # 🟡 Near الخارجي
             scale = 0.003
             note = "Soft avoidance (outer near zone)"
 
@@ -301,16 +290,11 @@ def compute_server_avoidance(
 
 
 # ======================================
-# 🛰 PUT /uav  — إرسال أو تحديث طائرة (مع Logging)
+# 🛰 PUT /uav  — تخزين / تحديث موقع UAV + Logging
 # ======================================
 
 @app.put("/uav", summary="Update or create UAV position (logging enabled)")
 def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
-    """
-    نفس اللي تستعمله من MATLAB:
-    - يخزن آخر حالة في جدول uav_state
-    - يسجل حركة جديدة في جدول uav_history (Logging)
-    """
     now = datetime.now(timezone.utc)
 
     state = db.query(UAVState).filter(UAVState.uav_id == uav.uav_id).first()
@@ -332,7 +316,6 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
         state.altitude = uav.altitude
         state.timestamp = now
 
-    # Logging
     hist = UAVHistory(
         uav_id=uav.uav_id,
         city=uav.city or "Baghdad",
@@ -346,44 +329,39 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(state)
 
-    return {
-        "status": "ok",
-        "uav_id": state.uav_id,
-        "timestamp": state.timestamp,
-    }
+    return {"status": "ok", "uav_id": state.uav_id, "timestamp": state.timestamp}
 
 
 # ======================================
-# 📥 GET /uavs — مع خيار process للتجنب داخل السيرفر
+# 📥 GET /uavs — تحليل + (اختياري) تجنّب داخل السيرفر
 # ======================================
 
 @app.get(
     "/uavs",
     response_model=UAVListOut,
-    summary="Get all UAVs with status, prediction and (optional) server-side avoidance"
+    summary="Get all UAVs with status, prediction and optional server-side avoidance"
 )
 def get_uavs(
-    process: bool = False,  # إذا true: يطبق التجنب داخل السيرفر
+    process: bool = Query(False, description="If true, apply server-side avoidance"),
     db: Session = Depends(get_db)
 ):
-    # نجيب الحالة الحالية
     uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
 
     if not uavs:
         return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
 
-    # --------- خطوة 1: نحسب الـ conflicts على الحالة الحالية ---------
+    # BEFORE conflicts
     conflict_info = compute_conflicts(uavs)
+
+    # إذا نريد المعالجة داخل السيرفر
     avoidance_dict: Dict[int, Optional[Avoidance]] = {}
 
-    # --------- خطوة 2: إذا process=True نطبق التجنب ونحدّث الـ DB ---------
     if process:
-        now = datetime.now(timezone.utc)
-
-        # نحسب متّجهات التجنب حسب 3-Zone Near
+        # حساب متجهات التجنب
         avoidance_dict = compute_server_avoidance(uavs, conflict_info)
 
-        # نطبق الحركة على كل UAV ونضيف للـ history
+        now = datetime.now(timezone.utc)
+        # تطبيق الحركة على الـ DB + logging
         for u in uavs:
             avoid = avoidance_dict.get(u.uav_id)
             if avoid is None:
@@ -405,18 +383,19 @@ def get_uavs(
 
         db.commit()
 
-        # نعيد القراءة بعد الحركة
+        # إعادة القراءة + إعادة حساب الـ conflicts بعد الحركة
         uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
         conflict_info = compute_conflicts(uavs)
     else:
-        # إذا مكو تجنب، نخلي avoidance_dict فارغ (suggestion optional إذا حبيتي)
+        # إذا ما نريد معالجة، نخلي avoidance None للجميع
         avoidance_dict = {u.uav_id: None for u in uavs}
 
-    # --------- خطوة 3: نحسب السرعات + التنبؤ ---------
     velocities = compute_velocities(db)
 
     out_list: List[UAVOut] = []
     counts = {"collision": 0, "near": 0, "safe": 0}
+
+    uav_by_id = {u.uav_id: u for u in uavs}
 
     for u in uavs:
         info = conflict_info[u.uav_id]
@@ -428,7 +407,6 @@ def get_uavs(
         vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
         pred = predict_position(u, vel, t=5.0)
 
-        # conflicts_with: نحول إلى list
         conflict_ids = list(info["conflicts"])
         avoid = avoidance_dict.get(u.uav_id)
 
@@ -457,7 +435,7 @@ def get_uavs(
 
 
 # ======================================
-# 📜 GET /logs — آخر N حركة (Logging)
+# 📜 GET /logs — آخر N حركة
 # ======================================
 
 @app.get("/logs", summary="Get last N UAV logs")
@@ -487,7 +465,7 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 
 # ======================================
-# ❤️ Health Check بسيط
+#  Health Check
 # ======================================
 
 @app.get("/health", summary="Simple health check")

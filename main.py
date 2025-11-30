@@ -109,13 +109,14 @@ class UAVListOut(BaseModel):
 # ======================================
 
 app = FastAPI(
-    title="UAV Server – Collision + AI + Logging",
-    version="2.0"
+    title="UAV Server – Collision + AI + Logging (Server-Side Avoidance)",
+    version="3.0"
 )
 
 # Thresholds بالكيلومتر
-THR_COLLISION_KM = 1.0
-THR_NEAR_KM = 3.0
+THR_COLLISION_KM = 1.0       # تصادم
+THR_NEAR_KM = 3.0            # نهاية منطقة الخطر
+INNER_NEAR_KM = 1.5          # near الداخلي (اللي قلتي عليه)
 
 
 # ======================================
@@ -235,35 +236,68 @@ def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
     return info
 
 
-def avoidance_vector(uav: UAVState, conflicts: List[UAVState]) -> Optional[Avoidance]:
+def compute_server_avoidance(
+    uavs: List[UAVState],
+    conflict_info: Dict[int, Dict[str, Any]]
+) -> Dict[int, Optional[Avoidance]]:
     """
-    Avoidance بسيط: متّجه تنافري Repulsive
-    يبعد الطائرة عن باقي الطائرات اللي قريبة منها
+    تجنّب داخل السيرفر:
+    - يستخدم 3 مستويات:
+      * d < 1 km        → Collision  → تجنب قوي
+      * 1 ≤ d < 1.5 km  → Inner Near → تجنب متوسط (يغير اتجاهه بوضوح)
+      * 1.5 ≤ d < 3 km  → Outer Near → تجنب خفيف
+    - يرجع Avoidance لكل UAV (أو None)
     """
-    if not conflicts:
-        return None
+    id_to_uav = {u.uav_id: u for u in uavs}
+    result: Dict[int, Optional[Avoidance]] = {}
 
-    ax = 0.0
-    ay = 0.0
+    for u in uavs:
+        info = conflict_info[u.uav_id]
+        dmin = info["min_dist"]
+        neighbors_ids = list(info["conflicts"])
 
-    for other in conflicts:
-        dx = uav.x - other.x
-        dy = uav.y - other.y
-        dist = math.hypot(dx, dy) + 1e-6
-        ax += dx / dist
-        ay += dy / dist
+        if dmin >= THR_NEAR_KM or not neighbors_ids:
+            result[u.uav_id] = None
+            continue
 
-    ax /= len(conflicts)
-    ay /= len(conflicts)
+        # متّجه تنافري من الجيران
+        ax = 0.0
+        ay = 0.0
+        for nid in neighbors_ids:
+            other = id_to_uav[nid]
+            dx = u.x - other.x
+            dy = u.y - other.y
+            dist = math.hypot(dx, dy) + 1e-6
+            ax += dx / dist
+            ay += dy / dist
 
-    # scale صغير حتى الحركة ما تكون عنيفة بالإحداثيات
-    scale = 0.001
+        ax /= len(neighbors_ids)
+        ay /= len(neighbors_ids)
 
-    return Avoidance(
-        suggested_dx=ax * scale,
-        suggested_dy=ay * scale,
-        note="Simple repulsive avoidance vector in coordinate units."
-    )
+        # اختيار قوة الدفع حسب المسافة (3-Zone Near)
+        if dmin < THR_COLLISION_KM:
+            # 🔴 Collision – قوي
+            scale = 0.015
+            note = "Strong avoidance (collision zone)"
+        elif dmin < INNER_NEAR_KM:
+            # 🟠 Near الداخلي
+            scale = 0.008
+            note = "Medium avoidance (inner near zone)"
+        else:
+            # 🟡 Near الخارجي
+            scale = 0.003
+            note = "Soft avoidance (outer near zone)"
+
+        dx_apply = ax * scale
+        dy_apply = ay * scale
+
+        result[u.uav_id] = Avoidance(
+            suggested_dx=dx_apply,
+            suggested_dy=dy_apply,
+            note=note
+        )
+
+    return result
 
 
 # ======================================
@@ -320,29 +354,73 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
 
 
 # ======================================
-# 📥 GET /uavs — كل الطائرات مع:
-#   status + prediction + avoidance + conflicts
+# 📥 GET /uavs — مع خيار process للتجنب داخل السيرفر
 # ======================================
 
-@app.get("/uavs", response_model=UAVListOut,
-         summary="Get all UAVs with status, prediction and avoidance")
-def get_uavs(db: Session = Depends(get_db)):
+@app.get(
+    "/uavs",
+    response_model=UAVListOut,
+    summary="Get all UAVs with status, prediction and (optional) server-side avoidance"
+)
+def get_uavs(
+    process: bool = False,  # إذا true: يطبق التجنب داخل السيرفر
+    db: Session = Depends(get_db)
+):
+    # نجيب الحالة الحالية
     uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
 
     if not uavs:
         return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
 
+    # --------- خطوة 1: نحسب الـ conflicts على الحالة الحالية ---------
     conflict_info = compute_conflicts(uavs)
+    avoidance_dict: Dict[int, Optional[Avoidance]] = {}
+
+    # --------- خطوة 2: إذا process=True نطبق التجنب ونحدّث الـ DB ---------
+    if process:
+        now = datetime.now(timezone.utc)
+
+        # نحسب متّجهات التجنب حسب 3-Zone Near
+        avoidance_dict = compute_server_avoidance(uavs, conflict_info)
+
+        # نطبق الحركة على كل UAV ونضيف للـ history
+        for u in uavs:
+            avoid = avoidance_dict.get(u.uav_id)
+            if avoid is None:
+                continue
+
+            u.x += avoid.suggested_dx
+            u.y += avoid.suggested_dy
+            u.timestamp = now
+
+            hist = UAVHistory(
+                uav_id=u.uav_id,
+                city=u.city,
+                x=u.x,
+                y=u.y,
+                altitude=u.altitude,
+                timestamp=now,
+            )
+            db.add(hist)
+
+        db.commit()
+
+        # نعيد القراءة بعد الحركة
+        uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
+        conflict_info = compute_conflicts(uavs)
+    else:
+        # إذا مكو تجنب، نخلي avoidance_dict فارغ (suggestion optional إذا حبيتي)
+        avoidance_dict = {u.uav_id: None for u in uavs}
+
+    # --------- خطوة 3: نحسب السرعات + التنبؤ ---------
     velocities = compute_velocities(db)
 
     out_list: List[UAVOut] = []
     counts = {"collision": 0, "near": 0, "safe": 0}
-    uav_by_id = {u.uav_id: u for u in uavs}
 
     for u in uavs:
         info = conflict_info[u.uav_id]
         status = info["status"]
-
         if status not in counts:
             counts[status] = 0
         counts[status] += 1
@@ -350,9 +428,9 @@ def get_uavs(db: Session = Depends(get_db)):
         vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
         pred = predict_position(u, vel, t=5.0)
 
+        # conflicts_with: نحول إلى list
         conflict_ids = list(info["conflicts"])
-        conflict_objs = [uav_by_id[cid] for cid in conflict_ids]
-        avoid = avoidance_vector(u, conflict_objs)
+        avoid = avoidance_dict.get(u.uav_id)
 
         out = UAVOut(
             uav_id=u.uav_id,

@@ -19,24 +19,18 @@ Base = declarative_base()
 
 
 class UAVState(Base):
-    """
-    حالة كل UAV الحالية (آخر موقع)
-    """
     __tablename__ = "uav_state"
 
     id = Column(Integer, primary_key=True, index=True)
     uav_id = Column(Integer, unique=True, index=True, nullable=False)
     city = Column(String, default="Baghdad")
-    x = Column(Float, nullable=False)        # longitude
-    y = Column(Float, nullable=False)        # latitude
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
     altitude = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class UAVHistory(Base):
-    """
-    لوج كامل للحركات (لكل تحديث)
-    """
     __tablename__ = "uav_history"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -60,7 +54,7 @@ def get_db():
 
 
 # ======================================
-# 🧱 Pydantic Models (IN / OUT)
+# 🧱 Pydantic Models
 # ======================================
 
 class UAVIn(BaseModel):
@@ -90,7 +84,7 @@ class UAVOut(BaseModel):
     y: float
     altitude: float
     timestamp: datetime
-    status: str            # "safe" / "near" / "collision"
+    status: str
     min_distance_km: float
     predicted: Optional[Prediction] = None
     avoidance: Optional[Avoidance] = None
@@ -106,7 +100,7 @@ class UAVListOut(BaseModel):
 
 
 # ======================================
-# ⚙️ إعداد التطبيق
+# ⚙️ إعداد التطبيق + Route رئيسية
 # ======================================
 
 app = FastAPI(
@@ -114,37 +108,39 @@ app = FastAPI(
     version="3.0"
 )
 
-# Thresholds بالكيلومتر
-THR_COLLISION_KM = 1.0       # تصادم
-INNER_NEAR_KM = 1.5          # Near الداخلي
-THR_NEAR_KM = 3.0            # نهاية الـ Near
+# ✨ هذا يحل مشكلة الـ 404 على Render
+@app.get("/")
+def root():
+    return {
+        "status": "server online",
+        "project": "UAV Collision + Predictive AI",
+        "message": "Welcome to the UAV Cloud Server"
+    }
+
+
+# Thresholds
+THR_COLLISION_KM = 1.0
+INNER_NEAR_KM = 1.5
+THR_NEAR_KM = 3.0
 
 
 # ======================================
-# 🧮 دوال مساعدة
+# 🧮 الدوال المساعدة
 # ======================================
 
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    مسافة تقريبية بالكيلومتر بين نقطتين (lat, lon)
-    """
+def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
-def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[str, float]]:
-    """
-    Predictive AI بسيطة: سرعة متوسطة لكل UAV من آخر history_window نقاط
-    """
-    result: Dict[int, Dict[str, float]] = {}
-
+def compute_velocities(db: Session, history_window: int = 3):
+    result = {}
     for uav_row in db.query(UAVState).all():
         hist = (
             db.query(UAVHistory)
@@ -167,44 +163,27 @@ def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[s
 
         dx = newest.x - oldest.x
         dy = newest.y - oldest.y
-        vx = dx / dt
-        vy = dy / dt
-        result[uav_row.uav_id] = {"vx": vx, "vy": vy}
+        result[uav_row.uav_id] = {"vx": dx / dt, "vy": dy / dt}
 
     return result
 
 
-def predict_position(uav: UAVState, vel: Dict[str, float], t: float = 5.0) -> Prediction:
-    """
-    توقع موقع UAV بعد t ثانية (إحداثيات)
-    """
-    x_pred = uav.x + vel.get("vx", 0.0) * t
-    y_pred = uav.y + vel.get("vy", 0.0) * t
-    return Prediction(t_seconds=t, x=x_pred, y=y_pred)
+def predict_position(uav: UAVState, vel, t: float = 5.0):
+    return Prediction(
+        t_seconds=t,
+        x=uav.x + vel["vx"] * t,
+        y=uav.y + vel["vy"] * t
+    )
 
 
-def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
-    """
-    حساب:
-    - أقل مسافة لكل UAV
-    - حالة safe / near / collision
-    - قائمة الـ conflicts
-    """
+def compute_conflicts(uavs: List[UAVState]):
     n = len(uavs)
-    info: Dict[int, Dict[str, Any]] = {}
-
-    for u in uavs:
-        info[u.uav_id] = {
-            "min_dist": float("inf"),
-            "status": "safe",
-            "conflicts": set(),  # set of uav_ids
-        }
+    info = {u.uav_id: {"min_dist": float("inf"), "status": "safe", "conflicts": set()} for u in uavs}
 
     for i in range(n):
         ui = uavs[i]
         for j in range(i + 1, n):
             uj = uavs[j]
-
             d = haversine_km(ui.y, ui.x, uj.y, uj.x)
 
             if d < info[ui.uav_id]["min_dist"]:
@@ -232,31 +211,21 @@ def compute_conflicts(uavs: List[UAVState]) -> Dict[int, Dict[str, Any]]:
     return info
 
 
-def compute_server_avoidance(
-    uavs: List[UAVState],
-    conflict_info: Dict[int, Dict[str, Any]]
-) -> Dict[int, Optional[Avoidance]]:
-    """
-    تجنّب داخل السيرفر (3 مستويات):
-    - d < 1 km        → Collision  → قوي
-    - 1 ≤ d < 1.5 km  → Inner Near → متوسط
-    - 1.5 ≤ d < 3 km  → Outer Near → خفيف
-    """
+def compute_server_avoidance(uavs, conflict_info):
     id_to_uav = {u.uav_id: u for u in uavs}
-    result: Dict[int, Optional[Avoidance]] = {}
+    result = {}
 
     for u in uavs:
         info = conflict_info[u.uav_id]
         dmin = info["min_dist"]
-        neighbors_ids = list(info["conflicts"])
+        neighbors = list(info["conflicts"])
 
-        if dmin >= THR_NEAR_KM or not neighbors_ids:
+        if dmin >= THR_NEAR_KM or not neighbors:
             result[u.uav_id] = None
             continue
 
-        ax = 0.0
-        ay = 0.0
-        for nid in neighbors_ids:
+        ax = ay = 0.0
+        for nid in neighbors:
             other = id_to_uav[nid]
             dx = u.x - other.x
             dy = u.y - other.y
@@ -264,8 +233,8 @@ def compute_server_avoidance(
             ax += dx / dist
             ay += dy / dist
 
-        ax /= len(neighbors_ids)
-        ay /= len(neighbors_ids)
+        ax /= len(neighbors)
+        ay /= len(neighbors)
 
         if dmin < THR_COLLISION_KM:
             scale = 0.015
@@ -277,12 +246,9 @@ def compute_server_avoidance(
             scale = 0.003
             note = "Soft avoidance (outer near zone)"
 
-        dx_apply = ax * scale
-        dy_apply = ay * scale
-
         result[u.uav_id] = Avoidance(
-            suggested_dx=dx_apply,
-            suggested_dy=dy_apply,
+            suggested_dx=ax * scale,
+            suggested_dy=ay * scale,
             note=note
         )
 
@@ -290,10 +256,10 @@ def compute_server_avoidance(
 
 
 # ======================================
-# 🛰 PUT /uav  — تخزين / تحديث موقع UAV + Logging
+# PUT /uav
 # ======================================
 
-@app.put("/uav", summary="Update or create UAV position (logging enabled)")
+@app.put("/uav")
 def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
 
@@ -302,15 +268,15 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
     if state is None:
         state = UAVState(
             uav_id=uav.uav_id,
-            city=uav.city or "Baghdad",
+            city=uav.city,
             x=uav.x,
             y=uav.y,
             altitude=uav.altitude,
-            timestamp=now,
+            timestamp=now
         )
         db.add(state)
     else:
-        state.city = uav.city or state.city
+        state.city = uav.city
         state.x = uav.x
         state.y = uav.y
         state.altitude = uav.altitude
@@ -318,127 +284,103 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
 
     hist = UAVHistory(
         uav_id=uav.uav_id,
-        city=uav.city or "Baghdad",
+        city=uav.city,
         x=uav.x,
         y=uav.y,
         altitude=uav.altitude,
-        timestamp=now,
+        timestamp=now
     )
     db.add(hist)
 
     db.commit()
     db.refresh(state)
 
-    return {"status": "ok", "uav_id": state.uav_id, "timestamp": state.timestamp}
+    return {"status": "ok", "uav_id": state.uav_id}
 
 
 # ======================================
-# 📥 GET /uavs — تحليل + (اختياري) تجنّب داخل السيرفر
+# GET /uavs
 # ======================================
 
-@app.get(
-    "/uavs",
-    response_model=UAVListOut,
-    summary="Get all UAVs with status, prediction and optional server-side avoidance"
-)
-def get_uavs(
-    process: bool = Query(False, description="If true, apply server-side avoidance"),
-    db: Session = Depends(get_db)
-):
+@app.get("/uavs", response_model=UAVListOut)
+def get_uavs(process: bool = False, db: Session = Depends(get_db)):
     uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
 
     if not uavs:
         return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
 
-    # BEFORE conflicts
     conflict_info = compute_conflicts(uavs)
 
-    # إذا نريد المعالجة داخل السيرفر
-    avoidance_dict: Dict[int, Optional[Avoidance]] = {}
-
     if process:
-        # حساب متجهات التجنب
-        avoidance_dict = compute_server_avoidance(uavs, conflict_info)
-
+        avoidance = compute_server_avoidance(uavs, conflict_info)
         now = datetime.now(timezone.utc)
-        # تطبيق الحركة على الـ DB + logging
+
         for u in uavs:
-            avoid = avoidance_dict.get(u.uav_id)
-            if avoid is None:
-                continue
+            avoid = avoidance.get(u.uav_id)
+            if avoid:
+                u.x += avoid.suggested_dx
+                u.y += avoid.suggested_dy
+                u.timestamp = now
+                db.add(
+                    UAVHistory(
+                        uav_id=u.uav_id,
+                        city=u.city,
+                        x=u.x,
+                        y=u.y,
+                        altitude=u.altitude,
+                        timestamp=now
+                    )
+                )
 
-            u.x += avoid.suggested_dx
-            u.y += avoid.suggested_dy
-            u.timestamp = now
+        db.commit()
+        uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
+        conflict_info = compute_conflicts(uavs)
+    else:
+        avoidance = {u.uav_id: None for u in uavs}
 
-            hist = UAVHistory(
+    velocities = compute_velocities(db)
+
+    out_list = []
+    counts = {"collision": 0, "near": 0, "safe": 0}
+
+    for u in uavs:
+        info = conflict_info[u.uav_id]
+        status = info["status"]
+        counts[status] += 1
+
+        vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
+        pred = predict_position(u, vel)
+
+        out_list.append(
+            UAVOut(
                 uav_id=u.uav_id,
                 city=u.city,
                 x=u.x,
                 y=u.y,
                 altitude=u.altitude,
-                timestamp=now,
+                timestamp=u.timestamp,
+                status=status,
+                min_distance_km=round(info["min_dist"], 3),
+                predicted=pred,
+                avoidance=avoidance.get(u.uav_id),
+                conflicts_with=list(info["conflicts"])
             )
-            db.add(hist)
-
-        db.commit()
-
-        # إعادة القراءة + إعادة حساب الـ conflicts بعد الحركة
-        uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
-        conflict_info = compute_conflicts(uavs)
-    else:
-        # إذا ما نريد معالجة، نخلي avoidance None للجميع
-        avoidance_dict = {u.uav_id: None for u in uavs}
-
-    velocities = compute_velocities(db)
-
-    out_list: List[UAVOut] = []
-    counts = {"collision": 0, "near": 0, "safe": 0}
-
-    uav_by_id = {u.uav_id: u for u in uavs}
-
-    for u in uavs:
-        info = conflict_info[u.uav_id]
-        status = info["status"]
-        if status not in counts:
-            counts[status] = 0
-        counts[status] += 1
-
-        vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
-        pred = predict_position(u, vel, t=5.0)
-
-        conflict_ids = list(info["conflicts"])
-        avoid = avoidance_dict.get(u.uav_id)
-
-        out = UAVOut(
-            uav_id=u.uav_id,
-            city=u.city,
-            x=u.x,
-            y=u.y,
-            altitude=u.altitude,
-            timestamp=u.timestamp,
-            status=status,
-            min_distance_km=round(info["min_dist"], 3),
-            predicted=pred,
-            avoidance=avoid,
-            conflicts_with=conflict_ids,
         )
-        out_list.append(out)
 
     return UAVListOut(
         count=len(out_list),
         uavs=out_list,
-        collisions=counts.get("collision", 0),
-        near=counts.get("near", 0),
-        safe=counts.get("safe", 0),
+        collisions=counts["collision"],
+        near=counts["near"],
+        safe=counts["safe"]
     )
 
 
 # ======================================
-# 📜 GET /logs — آخر N حركة
+# GET /logs
 # ======================================
 
-@app.get("/logs", summary="Get last N UAV logs")
+@app.get("/logs")
 def get_logs(limit: int = 100, db: Session = Depends(get_db)):
     if limit <= 0 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
@@ -465,9 +407,9 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 
 # ======================================
-#  Health Check
+# Health Check
 # ======================================
 
-@app.get("/health", summary="Simple health check")
+@app.get("/health")
 def health():
     return {"status": "ok"}

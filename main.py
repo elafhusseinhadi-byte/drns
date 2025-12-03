@@ -221,8 +221,13 @@ def compute_conflicts(uavs: List[UAVState]):
 
 def compute_server_avoidance(uavs: List[UAVState], conflict_info: Dict[int, Dict[str, Any]]):
     """
-    خوارزمية التجنب (Server-Side Avoidance B+C)
-    تعتمد على متجه تنافر من الجيران + scaling حسب مستوى الخطر
+    خوارزمية التجنب (Server-Side Avoidance B+C) – نسخة مقوّاة
+    تعتمد على:
+    - متجه تنافر من الجيران (repulsion)
+    - crowd factor حسب عدد الجيران
+    - jitter بسيط حتى يمنع التماثل
+    - scaling قوي حسب مستوى الخطر
+    - حد أعلى للحركة (clamp)
     """
     id_to_uav = {u.uav_id: u for u in uavs}
     result: Dict[int, Optional[Avoidance]] = {}
@@ -246,22 +251,45 @@ def compute_server_avoidance(uavs: List[UAVState], conflict_info: Dict[int, Dict
             ax += dx / dist
             ay += dy / dist
 
+        # متوسط اتجاهات الجيران
         ax /= len(neighbors)
         ay /= len(neighbors)
 
+        # 1) crowd-aware repulsion (إذا عنده جيران أكثر → دفع أقوى)
+        crowd_factor = min(len(neighbors), 5)
+        ax *= crowd_factor
+        ay *= crowd_factor
+
+        # 2) jitter خفيف حتى نكسر التماثل
+        jitter = (random.random() - 0.5) * 0.0008
+        ax += jitter
+        ay += jitter
+
+        # 3) scaling حسب مستوى الخطر
         if dmin < THR_COLLISION_KM:
-            scale = 0.015
-            note = "Strong avoidance (collision zone)"
+            scale = 0.045
+            note = "Ultra strong avoidance (collision zone)"
         elif dmin < INNER_NEAR_KM:
-            scale = 0.008
-            note = "Medium avoidance (inner near zone)"
+            scale = 0.025
+            note = "Strong avoidance (inner near zone)"
         else:
-            scale = 0.003
-            note = "Soft avoidance (outer near zone)"
+            scale = 0.010
+            note = "Moderate avoidance (outer near zone)"
+
+        ax *= scale
+        ay *= scale
+
+        # 4) max movement clamp (حتى ما تطفر برّه المنطقة)
+        max_step = 0.02  # تقريباً ~2 km
+        step = math.hypot(ax, ay)
+        if step > max_step:
+            f = max_step / step
+            ax *= f
+            ay *= f
 
         result[u.uav_id] = Avoidance(
-            suggested_dx=ax * scale,
-            suggested_dy=ay * scale,
+            suggested_dx=ax,
+            suggested_dy=ay,
             note=note
         )
 

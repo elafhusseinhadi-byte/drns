@@ -69,6 +69,7 @@ class Prediction(BaseModel):
     t_seconds: float
     x: float
     y: float
+    movement_km: float
 
 
 class Avoidance(BaseModel):
@@ -104,11 +105,12 @@ class UAVListOut(BaseModel):
 # ======================================
 
 app = FastAPI(
-    title="UAV Server – Collision + Predictive + Server-Side Avoidance",
-    version="3.0"
+    title="UAV Server – Collision + Hybrid Predictive AI + Server-Side Avoidance",
+    version="4.0"
 )
 
-# ✨ هذا يحل مشكلة الـ 404 على Render
+
+# ✨ حل مشكلة 404 على Render / Health root
 @app.get("/")
 def root():
     return {
@@ -129,18 +131,25 @@ THR_NEAR_KM = 3.0
 # ======================================
 
 def haversine_km(lat1, lon1, lat2, lon2):
+    """
+    حساب المسافة بين نقطتين على سطح الأرض بالكيلومتر
+    """
     R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 
-def compute_velocities(db: Session, history_window: int = 3):
-    result = {}
+def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[str, float]]:
+    """
+    حساب السرعة التقريبية لكل UAV من التاريخ (UAVHistory)
+    نعتمد على آخر history_window نقاط (مثل 3)
+    """
+    result: Dict[int, Dict[str, float]] = {}
     for uav_row in db.query(UAVState).all():
         hist = (
             db.query(UAVHistory)
@@ -168,22 +177,21 @@ def compute_velocities(db: Session, history_window: int = 3):
     return result
 
 
-def predict_position(uav: UAVState, vel, t: float = 5.0):
-    return Prediction(
-        t_seconds=t,
-        x=uav.x + vel["vx"] * t,
-        y=uav.y + vel["vy"] * t
-    )
-
-
 def compute_conflicts(uavs: List[UAVState]):
+    """
+    حساب أقل مسافة لكل UAV + حالة الخطر + قائمة الـ conflicts
+    """
     n = len(uavs)
-    info = {u.uav_id: {"min_dist": float("inf"), "status": "safe", "conflicts": set()} for u in uavs}
+    info: Dict[int, Dict[str, Any]] = {
+        u.uav_id: {"min_dist": float("inf"), "status": "safe", "conflicts": set()}
+        for u in uavs
+    }
 
     for i in range(n):
         ui = uavs[i]
         for j in range(i + 1, n):
             uj = uavs[j]
+            # انتبه: lat = y, lon = x
             d = haversine_km(ui.y, ui.x, uj.y, uj.x)
 
             if d < info[ui.uav_id]["min_dist"]:
@@ -211,15 +219,20 @@ def compute_conflicts(uavs: List[UAVState]):
     return info
 
 
-def compute_server_avoidance(uavs, conflict_info):
+def compute_server_avoidance(uavs: List[UAVState], conflict_info: Dict[int, Dict[str, Any]]):
+    """
+    خوارزمية التجنب (Server-Side Avoidance B+C)
+    تعتمد على متجه تنافر من الجيران + scaling حسب مستوى الخطر
+    """
     id_to_uav = {u.uav_id: u for u in uavs}
-    result = {}
+    result: Dict[int, Optional[Avoidance]] = {}
 
     for u in uavs:
         info = conflict_info[u.uav_id]
         dmin = info["min_dist"]
         neighbors = list(info["conflicts"])
 
+        # إذا ماكو خطر أو ما عنده جيران قريبين → لا يوجد تجنب
         if dmin >= THR_NEAR_KM or not neighbors:
             result[u.uav_id] = None
             continue
@@ -255,12 +268,106 @@ def compute_server_avoidance(uavs, conflict_info):
     return result
 
 
+def compute_hybrid_predictions(
+    uavs: List[UAVState],
+    conflict_info: Dict[int, Dict[str, Any]],
+    velocities: Dict[int, Dict[str, float]],
+    t: float = 5.0
+) -> Dict[int, Prediction]:
+    """
+    Hybrid Predictive AI (محسّن):
+    - يعتمد على السرعة المحسوبة من الـ history
+    - + متجه تنافر من الجيران (repulsion)
+    - + scaling حسب مستوى الخطر (collision / near / safe)
+    - + jitter صغير
+    - يرجع Prediction لكل UAV مع movement_km
+    """
+    id_to_uav = {u.uav_id: u for u in uavs}
+    preds: Dict[int, Prediction] = {}
+
+    for u in uavs:
+        info = conflict_info[u.uav_id]
+        dmin = info["min_dist"]
+        status = info["status"]
+        neighbors = list(info["conflicts"])
+
+        # ---- 1) Base velocity from history ----
+        vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
+        vx = vel["vx"]
+        vy = vel["vy"]
+
+        # ---- 2) Repulsion from neighbors ----
+        rx = ry = 0.0
+        if neighbors:
+            for nid in neighbors:
+                other = id_to_uav[nid]
+                dx = u.x - other.x
+                dy = u.y - other.y
+                dist = math.hypot(dx, dy) + 1e-6
+                rx += dx / dist
+                ry += dy / dist
+
+            rx /= len(neighbors)
+            ry /= len(neighbors)
+
+        # ---- 3) Scaling حسب مستوى الخطر ----
+        if status == "collision":
+            w_vel = 0.6
+            w_rep = 1.6
+        elif status == "near":
+            if dmin < INNER_NEAR_KM:
+                w_vel = 0.9
+                w_rep = 1.2
+            else:  # outer near
+                w_vel = 1.0
+                w_rep = 0.8
+        else:  # safe
+            w_vel = 1.1
+            w_rep = 0.3
+
+        # ---- 4) Limit base velocity magnitude ----
+        max_speed_deg = 0.0025  # حد أعلى تقريباً للسرعة بالـ degrees/second
+        base_speed = math.hypot(vx, vy)
+        if base_speed > 1e-9 and base_speed > max_speed_deg:
+            scale = max_speed_deg / base_speed
+            vx *= scale
+            vy *= scale
+
+        # ---- 5) Combine velocity + repulsion ----
+        # repulsion scaled بالقيمة 0.0015 حتى لا تكون حركة عنيفة
+        fx = w_vel * vx + w_rep * rx * 0.0015
+        fy = w_vel * vy + w_rep * ry * 0.0015
+
+        # ---- 6) Jitter صغير حتى ما يصير locking ----
+        jitter_scale = 5e-5
+        fx += random.uniform(-jitter_scale, jitter_scale)
+        fy += random.uniform(-jitter_scale, jitter_scale)
+
+        # ---- 7) Final predicted position ----
+        x_new = u.x + fx * t
+        y_new = u.y + fy * t
+
+        movement_km = haversine_km(u.y, u.x, y_new, x_new)
+
+        preds[u.uav_id] = Prediction(
+            t_seconds=t,
+            x=x_new,
+            y=y_new,
+            movement_km=round(movement_km, 5)
+        )
+
+    return preds
+
+
 # ======================================
 # PUT /uav
 # ======================================
 
 @app.put("/uav")
 def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
+    """
+    استقبال موقع UAV واحد وتحديث حالته + حفظها في الـ history
+    """
     now = datetime.now(timezone.utc)
 
     state = db.query(UAVState).filter(UAVState.uav_id == uav.uav_id).first()
@@ -304,13 +411,22 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
 
 @app.get("/uavs", response_model=UAVListOut)
 def get_uavs(process: bool = False, db: Session = Depends(get_db)):
+    """
+    إرجاع جميع الطائرات مع:
+    - حالة الخطر (collision / near / safe)
+    - أقل مسافة d_min
+    - التنبؤ بالموقع (Hybrid Predictive AI)
+    - معلومات التجنب إذا process=true
+    """
     uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
 
     if not uavs:
         return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
 
+    # 1) حساب التصادمات قبل التجنب أو بعده (حسب الحالة)
     conflict_info = compute_conflicts(uavs)
 
+    # 2) تطبيق تجنب فعلي على المواقع إذا process = true
     if process:
         avoidance = compute_server_avoidance(uavs, conflict_info)
         now = datetime.now(timezone.utc)
@@ -333,14 +449,19 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
                 )
 
         db.commit()
+        # إعادة تحميل الحالات بعد التحديث
         uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
         conflict_info = compute_conflicts(uavs)
     else:
         avoidance = {u.uav_id: None for u in uavs}
 
+    # 3) السرعات من الـ history
     velocities = compute_velocities(db)
 
-    out_list = []
+    # 4) Hybrid Predictive AI داخل السيرفر
+    hybrid_preds = compute_hybrid_predictions(uavs, conflict_info, velocities)
+
+    out_list: List[UAVOut] = []
     counts = {"collision": 0, "near": 0, "safe": 0}
 
     for u in uavs:
@@ -348,8 +469,7 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
         status = info["status"]
         counts[status] += 1
 
-        vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
-        pred = predict_position(u, vel)
+        pred = hybrid_preds[u.uav_id]
 
         out_list.append(
             UAVOut(
@@ -382,6 +502,9 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
 
 @app.get("/logs")
 def get_logs(limit: int = 100, db: Session = Depends(get_db)):
+    """
+    إرجاع آخر الحركات من جدول التاريخ UAVHistory
+    """
     if limit <= 0 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 1000")
 

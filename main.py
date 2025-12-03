@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
@@ -19,13 +19,17 @@ Base = declarative_base()
 
 
 class UAVState(Base):
+    """
+    x = latitude  (مثلاً 30.5 .. 30.9)
+    y = longitude (مثلاً 47.4 .. 47.9)
+    """
     __tablename__ = "uav_state"
 
     id = Column(Integer, primary_key=True, index=True)
     uav_id = Column(Integer, unique=True, index=True, nullable=False)
     city = Column(String, default="Baghdad")
-    x = Column(Float, nullable=False)
-    y = Column(Float, nullable=False)
+    x = Column(Float, nullable=False)   # latitude
+    y = Column(Float, nullable=False)   # longitude
     altitude = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -36,8 +40,8 @@ class UAVHistory(Base):
     id = Column(Integer, primary_key=True, index=True)
     uav_id = Column(Integer, index=True, nullable=False)
     city = Column(String, default="Baghdad")
-    x = Column(Float, nullable=False)
-    y = Column(Float, nullable=False)
+    x = Column(Float, nullable=False)   # latitude
+    y = Column(Float, nullable=False)   # longitude
     altitude = Column(Float, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
@@ -59,8 +63,8 @@ def get_db():
 
 class UAVIn(BaseModel):
     uav_id: int
-    x: float
-    y: float
+    x: float      # latitude
+    y: float      # longitude
     altitude: float
     city: Optional[str] = "Baghdad"
 
@@ -106,11 +110,10 @@ class UAVListOut(BaseModel):
 
 app = FastAPI(
     title="UAV Server – Collision + Hybrid Predictive AI + Server-Side Avoidance",
-    version="4.0"
+    version="4.1"
 )
 
 
-# ✨ حل مشكلة 404 على Render / Health root
 @app.get("/")
 def root():
     return {
@@ -133,6 +136,7 @@ THR_NEAR_KM = 3.0
 def haversine_km(lat1, lon1, lat2, lon2):
     """
     حساب المسافة بين نقطتين على سطح الأرض بالكيلومتر
+    (lat, lon) بالدرجات
     """
     R = 6371.0
     phi1 = math.radians(lat1)
@@ -170,8 +174,8 @@ def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[s
             result[uav_row.uav_id] = {"vx": 0.0, "vy": 0.0}
             continue
 
-        dx = newest.x - oldest.x
-        dy = newest.y - oldest.y
+        dx = newest.x - oldest.x   # lat diff
+        dy = newest.y - oldest.y   # lon diff
         result[uav_row.uav_id] = {"vx": dx / dt, "vy": dy / dt}
 
     return result
@@ -180,6 +184,7 @@ def compute_velocities(db: Session, history_window: int = 3) -> Dict[int, Dict[s
 def compute_conflicts(uavs: List[UAVState]):
     """
     حساب أقل مسافة لكل UAV + حالة الخطر + قائمة الـ conflicts
+    (x = lat, y = lon)
     """
     n = len(uavs)
     info: Dict[int, Dict[str, Any]] = {
@@ -191,8 +196,8 @@ def compute_conflicts(uavs: List[UAVState]):
         ui = uavs[i]
         for j in range(i + 1, n):
             uj = uavs[j]
-            # انتبه: lat = y, lon = x
-            d = haversine_km(ui.y, ui.x, uj.y, uj.x)
+
+            d = haversine_km(ui.x, ui.y, uj.x, uj.y)
 
             if d < info[ui.uav_id]["min_dist"]:
                 info[ui.uav_id]["min_dist"] = d
@@ -237,7 +242,6 @@ def compute_server_avoidance(uavs: List[UAVState], conflict_info: Dict[int, Dict
         dmin = info["min_dist"]
         neighbors = list(info["conflicts"])
 
-        # إذا ماكو خطر أو ما عنده جيران قريبين → لا يوجد تجنب
         if dmin >= THR_NEAR_KM or not neighbors:
             result[u.uav_id] = None
             continue
@@ -245,8 +249,8 @@ def compute_server_avoidance(uavs: List[UAVState], conflict_info: Dict[int, Dict
         ax = ay = 0.0
         for nid in neighbors:
             other = id_to_uav[nid]
-            dx = u.x - other.x
-            dy = u.y - other.y
+            dx = u.x - other.x   # lat diff
+            dy = u.y - other.y   # lon diff
             dist = math.hypot(dx, dy) + 1e-6
             ax += dx / dist
             ay += dy / dist
@@ -321,8 +325,8 @@ def compute_hybrid_predictions(
 
         # ---- 1) Base velocity from history ----
         vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
-        vx = vel["vx"]
-        vy = vel["vy"]
+        vx = vel["vx"]   # lat speed
+        vy = vel["vy"]   # lon speed
 
         # ---- 2) Repulsion from neighbors ----
         rx = ry = 0.0
@@ -362,7 +366,6 @@ def compute_hybrid_predictions(
             vy *= scale
 
         # ---- 5) Combine velocity + repulsion ----
-        # repulsion scaled بالقيمة 0.0015 حتى لا تكون حركة عنيفة
         fx = w_vel * vx + w_rep * rx * 0.0015
         fy = w_vel * vy + w_rep * ry * 0.0015
 
@@ -372,10 +375,10 @@ def compute_hybrid_predictions(
         fy += random.uniform(-jitter_scale, jitter_scale)
 
         # ---- 7) Final predicted position ----
-        x_new = u.x + fx * t
-        y_new = u.y + fy * t
+        x_new = u.x + fx * t   # lat new
+        y_new = u.y + fy * t   # lon new
 
-        movement_km = haversine_km(u.y, u.x, y_new, x_new)
+        movement_km = haversine_km(u.x, u.y, x_new, y_new)
 
         preds[u.uav_id] = Prediction(
             t_seconds=t,
@@ -451,7 +454,7 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
     if not uavs:
         return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
 
-    # 1) حساب التصادمات قبل التجنب أو بعده (حسب الحالة)
+    # 1) حساب التصادمات قبل/بعد التجنب
     conflict_info = compute_conflicts(uavs)
 
     # 2) تطبيق تجنب فعلي على المواقع إذا process = true

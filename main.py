@@ -412,4 +412,4 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"} كود السيرفر 
+    return {"status": "ok"} 

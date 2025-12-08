@@ -161,7 +161,11 @@ def predict_position(uav: UAVState, vel, t: float = 5.0):
 
 def compute_conflicts(uavs):
     info = {
-        u.uav_id: {"min_dist": float("inf"), "status": "safe", "conflicts": set()}
+        u.uav_id: {
+            "min_dist": float("inf"),
+            "status": "safe",
+            "conflicts": set()
+        }
         for u in uavs
     }
 
@@ -180,14 +184,20 @@ def compute_conflicts(uavs):
                 info[ui.uav_id]["conflicts"].add(uj.uav_id)
                 info[uj.uav_id]["conflicts"].add(ui.uav_id)
 
+            # تحديث الحالة حسب المسافة مع الحفاظ على أولوية التصادم
             if d < THR_COLLISION_KM:
                 info[ui.uav_id]["status"] = "collision"
                 info[uj.uav_id]["status"] = "collision"
-            elif d < THR_NEAR_KM:
+            elif d < INNER_NEAR_KM:
                 if info[ui.uav_id]["status"] != "collision":
-                    info[ui.uav_id]["status"] = "near"
+                    info[ui.uav_id]["status"] = "inner_near"
                 if info[uj.uav_id]["status"] != "collision":
-                    info[uj.uav_id]["status"] = "near"
+                    info[uj.uav_id]["status"] = "inner_near"
+            elif d < THR_NEAR_KM:
+                if info[ui.uav_id]["status"] not in ("collision", "inner_near"):
+                    info[ui.uav_id]["status"] = "outer_near"
+                if info[uj.uav_id]["status"] not in ("collision", "inner_near"):
+                    info[uj.uav_id]["status"] = "outer_near"
 
     for u in uavs:
         if info[u.uav_id]["min_dist"] == float("inf"):
@@ -223,13 +233,13 @@ def compute_server_avoidance(uavs, conflict_info):
 
         if dmin < THR_COLLISION_KM:
             scale = 0.015
-            note = "collision"
+            note = "collision_zone"
         elif dmin < INNER_NEAR_KM:
             scale = 0.008
-            note = "inner"
+            note = "inner_near_zone"
         else:
             scale = 0.003
-            note = "outer"
+            note = "outer_near_zone"
 
         result[u.uav_id] = Avoidance(
             suggested_dx=ax * scale,
@@ -316,12 +326,21 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
 
     velocities = compute_velocities(db)
 
+    counts = {
+        "collision": 0,
+        "inner_near": 0,
+        "outer_near": 0,
+        "safe": 0
+    }
+
     out_list = []
-    counts = {"collision": 0, "near": 0, "safe": 0}
 
     for u in uavs:
         info = conflict_info[u.uav_id]
         status = info["status"]
+
+        if status not in counts:
+            counts[status] = 0
         counts[status] += 1
 
         vel = velocities.get(u.uav_id, {"vx": 0.0, "vy": 0.0})
@@ -343,12 +362,19 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
             )
         )
 
+    collisions_count = counts.get("collision", 0)
+    inner_near_count = counts.get("inner_near", 0)
+    outer_near_count = counts.get("outer_near", 0)
+    safe_count = counts.get("safe", 0)
+
+    near_total = inner_near_count + outer_near_count
+
     return UAVListOut(
         count=len(out_list),
         uavs=out_list,
-        collisions=counts["collision"],
-        near=counts["near"],
-        safe=counts["safe"]
+        collisions=collisions_count,
+        near=near_total,
+        safe=safe_count
     )
 
 

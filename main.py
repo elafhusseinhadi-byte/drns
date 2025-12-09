@@ -21,6 +21,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ======================================
+# GLOBAL MODE (Study1 / Study2)
+# ======================================
+# "system"  -> Study 1 (server avoidance فعال)
+# "rl"      -> Study 2 (سيرفر فقط مراقبة + logging, بدون avoidance)
+CURRENT_MODE = "system"
+
+
+# ======================================
 # DB Models
 # ======================================
 class UAVState(Base):
@@ -132,6 +140,15 @@ class UAVListOut(BaseModel):
     collisions: int
     near: int
     safe: int
+    mode: str   # 🔹 نضيف المود هنا حتى MATLAB تقدر تشوفه
+
+
+class ModeIn(BaseModel):
+    mode: str
+
+
+class ModeOut(BaseModel):
+    mode: str
 
 
 app = FastAPI()
@@ -145,8 +162,26 @@ def root():
         "status": "server online",
         "version": "Ultra Pro",
         "project": "UAV Collision + Predictive AI",
-        "msg": "Ready for MATLAB + Streamlit"
+        "msg": "Ready for MATLAB + Streamlit + RL",
+        "mode": CURRENT_MODE
     }
+
+# ======================================
+# MODE CONTROL (Study1 / Study2)
+# ======================================
+@app.get("/mode", response_model=ModeOut)
+def get_mode():
+    return ModeOut(mode=CURRENT_MODE)
+
+
+@app.post("/mode", response_model=ModeOut)
+def set_mode(m: ModeIn):
+    global CURRENT_MODE
+    mode = m.mode.lower().strip()
+    if mode not in ("system", "rl"):
+        raise HTTPException(status_code=400, detail="mode must be 'system' or 'rl'")
+    CURRENT_MODE = mode
+    return ModeOut(mode=CURRENT_MODE)
 
 # ======================================
 # DELETE ALL /reset
@@ -300,6 +335,7 @@ def compute_avoidance(uavs, info):
         # المتوسط الاتجاهي للهروب
         ax = ay = 0.0
         for nid in st["conf"]:
+
             other = next(k for k in uavs if k.uav_id == nid)
             dx = u.x - other.x
             dy = u.y - other.y
@@ -322,7 +358,8 @@ def compute_avoidance(uavs, info):
         suggested_dy = ay * scale
 
         # adjust heading
-        new_h = math.atan2(math.sin(u.heading) + ay, math.cos(u.heading) + ax)
+        new_h = math.atan2(math.sin(u.heading) + ay,
+                           math.cos(u.heading) + ax)
         dheading = new_h - u.heading
 
         suggested_dv = -0.0002
@@ -337,17 +374,26 @@ def compute_avoidance(uavs, info):
     return out
 
 # ======================================
-# GET /uavs  (مع process لتفعيل التجنب)
+# GET /uavs  (مع process لتفعيل التجنب في Study1 فقط)
 # ======================================
 @app.get("/uavs", response_model=UAVListOut)
 def get_uavs(process: bool = False, db: Session = Depends(get_db)):
+    global CURRENT_MODE
+
     uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
     if not uavs:
-        return UAVListOut(count=0, uavs=[], collisions=0, near=0, safe=0)
+        return UAVListOut(
+            count=0, uavs=[],
+            collisions=0, near=0, safe=0,
+            mode=CURRENT_MODE
+        )
 
     info = compute_conflicts(uavs)
 
-    if process:
+    # ===============================
+    # Mode = "system"  (Study 1)
+    # ===============================
+    if CURRENT_MODE == "system" and process:
         avoidance = compute_avoidance(uavs, info)
         now = datetime.now(timezone.utc)
 
@@ -381,6 +427,7 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
         uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
         info = compute_conflicts(uavs)
     else:
+        # Mode = "rl" أو process=False -> ماكو Avoidance
         avoidance = {u.uav_id: None for u in uavs}
 
     out = []
@@ -414,7 +461,8 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
         uavs=out,
         collisions=counts["collision"],
         near=counts["inner_near"] + counts["outer_near"],
-        safe=counts["safe"]
+        safe=counts["safe"],
+        mode=CURRENT_MODE
     )
 
 # ======================================
@@ -501,4 +549,4 @@ def export_uav_history(limit: int = 5000, db: Session = Depends(get_db)):
 # ======================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "db": "online"}
+    return {"status": "ok", "db": "online", "mode": CURRENT_MODE}

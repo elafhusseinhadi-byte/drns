@@ -12,9 +12,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # ======================================
 DATABASE_URL = "sqlite:///./uav_ultra.db"
 
-# حذف قاعدة البيانات القديمة (مرة واحدة فقط) إذا تريد إعادة البناء
-# إذا تريد حذفها كل تشغيل، خليه مثل ما هو
-# إذا تريد تحذفها مرة واحدة فقط، احذفه بعد أول تشغيل
+# إذا الملف غير موجود يطبع بس رسالة (ما يحذفه كل مرة)
 if not os.path.exists("uav_ultra.db"):
     print("⚠️ Creating a fresh UAV database...")
 
@@ -63,6 +61,7 @@ class UAVHistory(Base):
     ay = Column(Float, default=0.0)
 
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -142,10 +141,15 @@ app = FastAPI()
 # ======================================
 @app.get("/")
 def root():
-    return {"status": "server online", "version": "Ultra Pro", "msg": "Ready for MATLAB + Streamlit"}
+    return {
+        "status": "server online",
+        "version": "Ultra Pro",
+        "project": "UAV Collision + Predictive AI",
+        "msg": "Ready for MATLAB + Streamlit"
+    }
 
 # ======================================
-# DELETE ALL
+# DELETE ALL /reset
 # ======================================
 @app.delete("/reset")
 def reset_uavs(db: Session = Depends(get_db)):
@@ -162,6 +166,7 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
     now = datetime.now(timezone.utc)
 
     state = db.query(UAVState).filter(UAVState.uav_id == uav.uav_id).first()
+    is_new = state is None   # 🔹 حتى نرجّع mode صحيح
 
     # -------- UPSERT: إذا الطائرة جديدة نضيفها --------
     if state is None:
@@ -207,7 +212,11 @@ def put_uav(uav: UAVIn, db: Session = Depends(get_db)):
     db.add(hist)
 
     db.commit()
-    return {"status": "ok", "mode": "insert" if state is None else "update", "uav_id": uav.uav_id}
+    return {
+        "status": "ok",
+        "mode": "insert" if is_new else "update",
+        "uav_id": uav.uav_id
+    }
 
 # ======================================
 # Haversine
@@ -252,6 +261,7 @@ def compute_conflicts(uavs):
             ui = uavs[i]
             uj = uavs[j]
 
+            # نفترض x = lon ، y = lat
             d = haversine_km(ui.y, ui.x, uj.y, uj.x)
             info[ui.uav_id]["min"] = min(info[ui.uav_id]["min"], d)
             info[uj.uav_id]["min"] = min(info[uj.uav_id]["min"], d)
@@ -288,17 +298,17 @@ def compute_avoidance(uavs, info):
             continue
 
         # المتوسط الاتجاهي للهروب
-        ax = ay = 0
+        ax = ay = 0.0
         for nid in st["conf"]:
             other = next(k for k in uavs if k.uav_id == nid)
             dx = u.x - other.x
             dy = u.y - other.y
-            d = math.hypot(dx, dy)+1e-6
-            ax += dx/d
-            ay += dy/d
+            d = math.hypot(dx, dy) + 1e-6
+            ax += dx / d
+            ay += dy / d
 
-        ax/=len(st["conf"])
-        ay/=len(st["conf"])
+        ax /= len(st["conf"])
+        ay /= len(st["conf"])
 
         # scale by danger
         if st["status"] == "collision":
@@ -308,11 +318,11 @@ def compute_avoidance(uavs, info):
         else:
             scale = 0.003
 
-        suggested_dx = ax*scale
-        suggested_dy = ay*scale
+        suggested_dx = ax * scale
+        suggested_dy = ay * scale
 
         # adjust heading
-        new_h = math.atan2(math.sin(u.heading)+ay, math.cos(u.heading)+ax)
+        new_h = math.atan2(math.sin(u.heading) + ay, math.cos(u.heading) + ax)
         dheading = new_h - u.heading
 
         suggested_dv = -0.0002
@@ -327,7 +337,7 @@ def compute_avoidance(uavs, info):
     return out
 
 # ======================================
-# GET /uavs
+# GET /uavs  (مع process لتفعيل التجنب)
 # ======================================
 @app.get("/uavs", response_model=UAVListOut)
 def get_uavs(process: bool = False, db: Session = Depends(get_db)):
@@ -346,6 +356,7 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
             if not a:
                 continue
 
+            # تحديث الموقع والسرعة والاتجاه بناءً على الـ Avoidance
             u.x += a.suggested_dx
             u.y += a.suggested_dy
 
@@ -366,17 +377,18 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
             ))
 
         db.commit()
+        # نعيد حساب الكونفلكت بعد التحديث
         uavs = db.query(UAVState).order_by(UAVState.uav_id).all()
         info = compute_conflicts(uavs)
     else:
         avoidance = {u.uav_id: None for u in uavs}
 
     out = []
-    counts = {"collision":0,"inner_near":0,"outer_near":0,"safe":0}
+    counts = {"collision": 0, "inner_near": 0, "outer_near": 0, "safe": 0}
 
     for u in uavs:
         st = info[u.uav_id]["status"]
-        counts[st]+=1
+        counts[st] += 1
 
         out.append(UAVOut(
             uav_id=u.uav_id,
@@ -390,8 +402,8 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
             ax=u.ax,
             ay=u.ay,
             status=st,
-            min_distance_km=round(info[u.uav_id]["min"],3),
-            predicted=predict_state(u,5),
+            min_distance_km=round(info[u.uav_id]["min"], 3),
+            predicted=predict_state(u, 5),
             future_path=predict_future(u),
             avoidance=avoidance.get(u.uav_id),
             conflicts_with=info[u.uav_id]["conf"]
@@ -401,19 +413,19 @@ def get_uavs(process: bool = False, db: Session = Depends(get_db)):
         count=len(out),
         uavs=out,
         collisions=counts["collision"],
-        near=counts["inner_near"]+counts["outer_near"],
+        near=counts["inner_near"] + counts["outer_near"],
         safe=counts["safe"]
     )
 
 # ======================================
-# LOGS
+# LOGS (آخر history)
 # ======================================
 @app.get("/logs")
 def get_logs(limit: int = 100, db: Session = Depends(get_db)):
     logs = (
         db.query(UAVHistory)
         .order_by(UAVHistory.timestamp.desc())
-        .limit(min(limit,2000))
+        .limit(min(limit, 2000))
         .all()
     )
     return [
@@ -434,8 +446,59 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
     ]
 
 # ======================================
+# EXPORT ENDPOINTS للبحث + MATLAB
+# ======================================
+
+# 🔹 حالة الطائرات الحالية (جدول uav_state)
+@app.get("/export/uav_state")
+def export_uav_state(db: Session = Depends(get_db)):
+    rows = db.query(UAVState).order_by(UAVState.uav_id).all()
+    return [
+        {
+            "uav_id": r.uav_id,
+            "city": r.city,
+            "x": r.x,
+            "y": r.y,
+            "altitude": r.altitude,
+            "velocity": r.velocity,
+            "heading": r.heading,
+            "ax": r.ax,
+            "ay": r.ay,
+            "timestamp": r.timestamp,
+        }
+        for r in rows
+    ]
+
+
+# 🔹 كامل التاريخ (جدول uav_history) مع خيار limit
+@app.get("/export/uav_history")
+def export_uav_history(limit: int = 5000, db: Session = Depends(get_db)):
+    rows = (
+        db.query(UAVHistory)
+        .order_by(UAVHistory.timestamp.asc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "uav_id": r.uav_id,
+            "city": r.city,
+            "x": r.x,
+            "y": r.y,
+            "altitude": r.altitude,
+            "velocity": r.velocity,
+            "heading": r.heading,
+            "ax": r.ax,
+            "ay": r.ay,
+            "timestamp": r.timestamp,
+        }
+        for r in rows
+    ]
+
+# ======================================
 # HEALTH
 # ======================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "db":"online"}
+    return {"status": "ok", "db": "online"}
